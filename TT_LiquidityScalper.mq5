@@ -48,9 +48,11 @@
 #define TTLS_MAX_SIGNALS         512
 //--- bars an aggressive setup may wait for its confirmation candle
 #define TTLS_MAX_CONFIRM_BARS    5
-//--- how much markup is rendered (chart hygiene, not logic)
-#define TTLS_DRAW_MAX_EVENTS     40
+//--- How much markup is rendered. Chart hygiene only - none of these affect
+//--- a single decision, they just stop the chart turning into a colour wash.
+#define TTLS_DRAW_MAX_EVENTS     18
 #define TTLS_DRAW_MAX_SIGNALS    40
+#define TTLS_DRAW_MAX_DEAD_ZONES 3
 //--- ATR period used for every adaptive tolerance in the package
 #define TTLS_ATR_PERIOD          14
 
@@ -1162,16 +1164,53 @@ void DrawTfMarkup(CStructureEngine &st, CZoneBook &zb, const ENUM_TIMEFRAMES tf,
       if(ev.Get(i, e))
          TTDrawStructEvent(e, tf, g_draw);
      }
-   for(int i = 0; i < zb.Count(); i++)
-     {
-      TTZone z;
-      if(zb.Get(i, z))
-         TTDrawZone(z, g_draw);
-     }
+   DrawZonesFor(zb, tf, true);
+   DrawZonesFor(zb, tf, false);
    if(withStrongWeak)
       TTDrawStrongWeak(tf, st.HasStrong(), st.StrongPrice(), st.StrongTime(),
                        st.StrongIsLow(), st.HasWeak(), st.WeakPrice(), st.WeakTime(),
                        g_draw);
+  }
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Zone rendering deliberately mirrors the ENGINE's view rather than |
+//| the book's full contents. Only the nearest MaxActiveZones per     |
+//| direction can ever arm a setup, so drawing the other forty-odd    |
+//| mapped zones - each stretched to the current bar - buried the     |
+//| chart under overlapping boxes and showed levels that could not    |
+//| produce a signal. Failed zones stay on for a while, greyed, so    |
+//| it is still visible WHY a level stopped working.                  |
+//+------------------------------------------------------------------+
+void DrawZonesFor(CZoneBook &zb, const ENUM_TIMEFRAMES tf, const bool bullish)
+  {
+   double   px  = SymbolInfoDouble(g_sym, SYMBOL_BID);
+   datetime now = TimeCurrent();
+   if(px <= 0.0)
+      return;
+
+   for(int rank = 0; rank < g_maxZones; rank++)
+     {
+      TTZone z;
+      if(!zb.NearestLive(rank, px, bullish, now, z))
+         break;
+      TTDrawZone(z, g_draw);
+     }
+
+   //--- recently invalidated zones, capped so history cannot pile up
+   datetime cutoff = (datetime)((long)now - (long)PeriodSeconds(tf) * g_draw.extendZonesBars);
+   int shown = 0;
+   for(int i = zb.Count() - 1; i >= 0 && shown < TTLS_DRAW_MAX_DEAD_ZONES; i--)
+     {
+      TTZone z;
+      if(!zb.Get(i, z))
+         continue;
+      if(z.state != TTZS_INVALID || z.bullish != bullish)
+         continue;
+      if(z.invalidTime < cutoff)
+         continue;
+      TTDrawZone(z, g_draw);
+      shown++;
+     }
   }
 //+------------------------------------------------------------------+
 void DrawLiquidity(void)
@@ -1244,6 +1283,7 @@ void UpdatePanel(void)
    info.bearState         = StateWord(g_bear.state);
    info.zonesBull         = g_zoneSetup.LiveCount(true, now);
    info.zonesBear         = g_zoneSetup.LiveCount(false, now);
+   info.zonesArmable      = g_maxZones;
    info.liquidityUnswept  = g_liq.UnsweptCount(now);
    info.signalsToday      = g_gov.CountOn(now);
    info.spreadPoints      = TTSpreadPoints(g_sym);

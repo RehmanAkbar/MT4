@@ -89,6 +89,7 @@ struct TTPanelInfo
    string            bearState;
    int               zonesBull;
    int               zonesBear;
+   int               zonesArmable;   // nearest-N per direction: what can actually fire
    int               liquidityUnswept;
    int               signalsToday;
    string            lastResult;
@@ -172,6 +173,12 @@ bool TTEnsure(const string name, const ENUM_OBJECT type, const int points,
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, name, OBJPROP_SELECTED,   false);
    ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+   //--- With "show object descriptions" enabled on the chart, MT5 prints an
+   //--- object's description next to it and falls back to the object NAME
+   //--- when none is set - which would splatter TTLS_TPB_1787656500B across
+   //--- the chart. Blank it here; TTText() sets its own text afterwards.
+   if(type != OBJ_TEXT && type != OBJ_LABEL)
+      ObjectSetString(0, name, OBJPROP_TEXT, "");
    return(true);
   }
 //+------------------------------------------------------------------+
@@ -239,9 +246,16 @@ void TTDrawStructEvent(const TTStructEvent &ev, const ENUM_TIMEFRAMES tf,
    TTSegment(ln, ev.swingTime, ev.price, ev.breakTime, ev.price,
              cfg.clrStructure, STYLE_SOLID, 1, false);
 
-   datetime mid = (datetime)((long)ev.swingTime + ((long)ev.breakTime - (long)ev.swingTime) / 2);
-   string   txt = (ev.isBOS ? "BOS" : "MS");
-   TTText(tx, mid, ev.price, txt, cfg.clrStructure, cfg.fontSize,
+   //--- MS and BOS routinely fire off the same swing a few bars apart and at
+   //--- nearly the same price, which stacked their labels into unreadable
+   //--- soup ("BOBS"). Park BOS on the far end of its line and MS at the
+   //--- midpoint so the two never share an anchor.
+   long   t0  = (long)ev.swingTime;
+   long   t1  = (long)ev.breakTime;
+   datetime at = ev.isBOS ? (datetime)(t0 + (t1 - t0) * 3 / 4)
+                          : (datetime)(t0 + (t1 - t0) / 3);
+   string txt = (ev.isBOS ? "BOS" : "MS");
+   TTText(tx, at, ev.price, txt, cfg.clrStructure, cfg.fontSize,
           ev.bullish ? ANCHOR_LOWER : ANCHOR_UPPER);
   }
 //+------------------------------------------------------------------+
@@ -475,8 +489,11 @@ void TTDrawPanel(const TTPanelInfo &info, const TTDrawCfg &cfg)
                 "Long state : " + info.bullState, bull, cfg);
    TTPanelLabel(TTObjName("P", "4"), r++, TTLS_PANEL_ROWS,
                 "Short state: " + info.bearState, bear, cfg);
+   //--- mapped totals, plus how many of them can actually arm a setup: the
+   //--- raw count alone read as though 47 zones were live triggers
    TTPanelLabel(TTObjName("P", "5"), r++, TTLS_PANEL_ROWS,
-                StringFormat("Zones      : %d dem / %d sup", info.zonesBull, info.zonesBear),
+                StringFormat("Zones      : %d dem / %d sup (top %d)",
+                             info.zonesBull, info.zonesBear, info.zonesArmable),
                 normal, cfg);
    TTPanelLabel(TTObjName("P", "6"), r++, TTLS_PANEL_ROWS,
                 StringFormat("Liquidity  : %d unswept", info.liquidityUnswept), normal, cfg);
