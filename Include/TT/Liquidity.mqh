@@ -44,6 +44,15 @@ struct TTLiqPool
    double            price;        // the extreme of the cluster - the level that must break
    datetime          firstTime;    // oldest swing in the cluster
    datetime          lastTime;     // newest swing in the cluster
+   //--- When the pool became KNOWN: the close of the bar that confirmed its
+   //--- first swing, never the swing's own bar. A swing is only real
+   //--- SwingRightBars bars after it prints, so gating a historical target
+   //--- query on firstTime would hand it a level nobody could see yet.
+   datetime          knownTime;
+   //--- When the pool stopped being a valid target - swept or broken - stamped
+   //--- with the CLOSE of the deciding bar. `active`/`swept`/`broken` describe
+   //--- today; this is what a query at a past `asOf` has to read instead.
+   datetime          deadTime;
    int               count;        // number of clustered swings (>=2 == equal highs/lows)
    bool              buySide;      // true = above price (swing highs), false = below
    bool              active;       // still a valid target
@@ -89,6 +98,11 @@ private:
    int               m_nextId;
 
    double            PointSize(void);
+   //--- had this pool already been swept or broken at time asOf?
+   bool              DeadAt(const int i, const datetime asOf)
+     {
+      return(m_pools[i].deadTime != 0 && m_pools[i].deadTime <= asOf);
+     }
    double            SweepBuffer(const int b);
    int               FindMergeable(const double price, const bool buySide, const double tol);
    void              Compact(void);
@@ -99,8 +113,11 @@ public:
                      CLiquidityMap(void);
    void              Init(CTfData *data, const TTLiqCfg &cfg);
    void              Reset(void);
-   //--- register a freshly confirmed swing (call once per confirmation)
-   void              OnSwingConfirmed(const TTSwing &s, const double atr);
+   //--- register a freshly confirmed swing (call once per confirmation).
+   //--- knownTime is the CLOSE of the bar that confirmed it - the instant the
+   //--- pool became visible to anyone.
+   void              OnSwingConfirmed(const TTSwing &s, const double atr,
+                                      const datetime knownTime);
    //--- evaluate bar b against every live pool; true when a sweep completed
    bool              PhaseSweep(const int b, TTSweepInfo &out);
    //--- distance allowed between a sweep and the zone it must belong to
@@ -230,7 +247,8 @@ int CLiquidityMap::FindMergeable(const double price, const bool buySide, const d
 //| moves OUTWARD to the extreme of the cluster - price has to clear  |
 //| every one of those highs to actually collect the stops behind it. |
 //+------------------------------------------------------------------+
-void CLiquidityMap::OnSwingConfirmed(const TTSwing &s, const double atr)
+void CLiquidityMap::OnSwingConfirmed(const TTSwing &s, const double atr,
+                                     const datetime knownTime)
   {
    double tol = atr * m_cfg.eqTolAtr;
    double flr = TTLS_MIN_TOL_POINTS * PointSize();
@@ -264,6 +282,8 @@ void CLiquidityMap::OnSwingConfirmed(const TTSwing &s, const double atr)
    p.price        = s.price;
    p.firstTime    = s.time;
    p.lastTime     = s.time;
+   p.knownTime    = knownTime;
+   p.deadTime     = 0;
    p.count        = 1;
    p.buySide      = s.isHigh;
    p.active       = true;
@@ -282,8 +302,9 @@ void CLiquidityMap::OnSwingConfirmed(const TTSwing &s, const double atr)
 //+------------------------------------------------------------------+
 bool CLiquidityMap::CompleteSweep(const int i, const int b, TTSweepInfo &out)
   {
-   m_pools[i].swept  = true;
-   m_pools[i].active = false;
+   m_pools[i].swept    = true;
+   m_pools[i].active   = false;
+   m_pools[i].deadTime = m_data.CloseTime(b);    // known spent at this close
    if(m_pools[i].pendBars < 0)                   // same-bar sweep
      {
       m_pools[i].sweepTime    = m_data.Time(b);
@@ -384,6 +405,7 @@ bool CLiquidityMap::StepPending(const int i, const int b, TTSweepInfo &out)
       m_pools[i].pendBars = -1;
       m_pools[i].active   = false;
       m_pools[i].broken   = true;
+      m_pools[i].deadTime = m_data.CloseTime(b);
      }
    return(false);
   }
@@ -421,8 +443,9 @@ bool CLiquidityMap::StepFresh(const int i, const int b, const double buf, TTSwee
    bool through = bs ? (cl > P + buf) : (cl < P - buf);
    if(through)
      {
-      m_pools[i].active = false;
-      m_pools[i].broken = true;
+      m_pools[i].active   = false;
+      m_pools[i].broken   = true;
+      m_pools[i].deadTime = m_data.CloseTime(b);
      }
    return(false);
   }
@@ -431,7 +454,7 @@ int CLiquidityMap::UnsweptCount(const datetime asOf)
   {
    int n = 0;
    for(int i = 0; i < m_count; i++)
-      if(m_pools[i].active && m_pools[i].firstTime <= asOf)
+      if(!DeadAt(i, asOf) && m_pools[i].knownTime <= asOf)
          n++;
    return(n);
   }
@@ -439,6 +462,11 @@ int CLiquidityMap::UnsweptCount(const datetime asOf)
 //| Nearest live pool beyond `from`. Used for TARGET_NEAREST_INTERNAL:|
 //| a scalp is closed where the next batch of resting orders sits,    |
 //| not at an arbitrary multiple of risk.                             |
+//|                                                                   |
+//| Both bounds are AS OF `asOf`. Reading `active` instead of deadTime |
+//| would drop a pool from a historical target search because it was   |
+//| swept LATER - a target chosen with hindsight, which is exactly the |
+//| repaint this package forbids.                                      |
 //+------------------------------------------------------------------+
 bool CLiquidityMap::NearestUnswept(const double from, const bool buySide,
                                    const datetime asOf, TTLiqPool &out)
@@ -447,9 +475,11 @@ bool CLiquidityMap::NearestUnswept(const double from, const bool buySide,
    double bestD = 0.0;
    for(int i = 0; i < m_count; i++)
      {
-      if(!m_pools[i].active || m_pools[i].buySide != buySide)
+      if(m_pools[i].buySide != buySide)
          continue;
-      if(m_pools[i].firstTime > asOf)            // not yet known at that moment
+      if(m_pools[i].knownTime > asOf)            // not yet known at that moment
+         continue;
+      if(DeadAt(i, asOf))                        // already spent by then
          continue;
       double d = buySide ? (m_pools[i].price - from) : (from - m_pools[i].price);
       if(d <= 0.0)

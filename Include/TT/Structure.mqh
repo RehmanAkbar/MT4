@@ -42,9 +42,23 @@
 //--- rebuild asked for it, the rebuild would produce a different signal set.
 //--- Structure breaks and swings are far rarer than bars, so these caps cover
 //--- a few thousand bars per timeframe with room to spare.
+//--- Swings: every consumer (NewestUnbroken, ExtremeInWindow, FindByTime) asks
+//--- about the CURRENT leg, so evicting ancient swings costs nothing.
 #define TTLS_MAX_SWINGS          512
-#define TTLS_MAX_EVENTS          1024
-#define TTLS_MAX_TRACK           512
+//--- Events: FirstShiftAfter() is a genuinely HISTORICAL query - it scans the
+//--- whole ring for the oldest shift in a window that can sit thousands of bars
+//--- back. The ring therefore has to span the entire rebuilt history or an
+//--- evicted event silently changes the conservative signal set on reload, the
+//--- same defect the per-timeframe history depth used to cause. Sized for the
+//--- EntryTF, which now covers the SetupTF's full span (see TTHistoryBarsFor)
+//--- and so holds the most events of the three engines.
+#define TTLS_MAX_EVENTS          4096
+//--- The per-direction STATE tracks transition several times per setup, so this
+//--- cap is hit far sooner than the trend/level tracks. Once a track evicts its
+//--- oldest half ValueAt() clamps to the oldest survivor, and the SetupState
+//--- buffer silently reads IDLE on older bars - which matters because an EA
+//--- consumes that buffer. Sized for a full MaxHistoryBars rebuild instead.
+#define TTLS_MAX_TRACK           4096
 
 //--- how far back from a structure break we hunt for the origin candle
 #define TTLS_ZONE_LOOKBACK       30
@@ -353,7 +367,9 @@ public:
    int               Count(void) { return m_count; }
    void              Add(const TTStructEvent &e);
    bool              Get(const int i, TTStructEvent &out);
-   //--- oldest event in (after, upto] matching direction; MS preferred over BOS
+   //--- oldest event in (after, upto] matching direction. MS and BOS rank
+   //--- equally - see the note on the definition for why refusing BOS would
+   //--- disable conservative entries in a trending market.
    bool              FirstShiftAfter(const datetime after, const datetime upto,
                                      const bool bullish, TTStructEvent &out);
   };
@@ -586,6 +602,11 @@ private:
    double            m_strongPrice, m_weakPrice;
    datetime          m_strongTime,  m_weakTime;
    bool              m_strongIsLow;             // true in a bull leg, false in a bear leg
+   //--- Which side the weak level sits on, recorded WHERE IT IS SET rather than
+   //--- inferred from m_strongIsLow: the two are set independently, and a weak
+   //--- level that exists without a strong one would otherwise be labelled from
+   //--- m_strongIsLow's default and come out backwards.
+   bool              m_weakIsHigh;
    //--- swings confirmed during the current bar (fed to the liquidity map)
    int               m_freshCount;
    TTSwing           m_fresh[4];
@@ -626,6 +647,7 @@ public:
    datetime          StrongTime(void) { return m_strongTime; }
    datetime          WeakTime(void) { return m_weakTime; }
    bool              StrongIsLow(void) { return m_strongIsLow; }
+   bool              WeakIsHigh(void) { return m_weakIsHigh; }
    //--- swings confirmed by the most recent PhasePivot() call
    int               FreshCount(void) { return m_freshCount; }
    bool              Fresh(const int i, TTSwing &out);
@@ -663,6 +685,7 @@ void CStructureEngine::ResetState(void)
    m_strongTime   = 0;
    m_weakTime     = 0;
    m_strongIsLow  = true;
+   m_weakIsHigh   = true;
    m_freshCount   = 0;
    m_didReset     = true;
   }
@@ -696,7 +719,17 @@ bool CStructureEngine::BeginUpdate(const bool rebuild, const int maxHistory, int
    startB     = 0;
    m_didReset = false;
    int bars = Bars(m_symbol, m_tf);
-   int span = m_cfg.leftBars + m_cfg.rightBars + TTLS_ZONE_LOOKBACK + 12;
+   //--- Context padding loaded BEHIND the oldest bar we process. It has to
+   //--- cover the deepest backward reach of every phase, or a phase silently
+   //--- sees a truncated window and answers differently on an incremental
+   //--- update (window == startB + span) than on a rebuild (window == 2000+).
+   //--- The deepest reach is IsUntestedExtreme(), which starts from an origin
+   //--- candle up to TTLS_ZONE_LOOKBACK back and then scans a further
+   //--- TTLS_EXTREME_LOOKBACK bars: omitting the second term made a live run
+   //--- grade a zone "untested" that a reload graded "tested", moving the
+   //--- published quality score by TTQ_UNTESTED_EXTREME points.
+   int span = m_cfg.leftBars + m_cfg.rightBars
+              + TTLS_ZONE_LOOKBACK + TTLS_EXTREME_LOOKBACK + 12;
    if(bars < span + 10)
       return(false);                              // history still loading
 
@@ -807,9 +840,10 @@ void CStructureEngine::RegisterSwing(const int p, const bool isHigh, const int b
       //--- in a bull leg the highs are the weak side: each new one is the target
       if(m_trend == TT_TREND_BULL)
         {
-         m_hasWeak   = true;
-         m_weakPrice = s.price;
-         m_weakTime  = s.time;
+         m_hasWeak    = true;
+         m_weakPrice  = s.price;
+         m_weakTime   = s.time;
+         m_weakIsHigh = true;
          m_weakTrack.Push(m_data.CloseTime(b), m_weakPrice);
         }
      }
@@ -820,9 +854,10 @@ void CStructureEngine::RegisterSwing(const int p, const bool isHigh, const int b
       m_actLowTime = s.time;
       if(m_trend == TT_TREND_BEAR)
         {
-         m_hasWeak   = true;
-         m_weakPrice = s.price;
-         m_weakTime  = s.time;
+         m_hasWeak    = true;
+         m_weakPrice  = s.price;
+         m_weakTime   = s.time;
+         m_weakIsHigh = false;
          m_weakTrack.Push(m_data.CloseTime(b), m_weakPrice);
         }
      }
@@ -915,9 +950,10 @@ void CStructureEngine::ApplyBullBreak(const int b, const int hiIdx, const TTSwin
    m_actLow     = m_strongPrice;
    m_actLowTime = m_strongTime;
    //--- until a fresh high prints, the broken high is the weak-side reference
-   m_hasWeak   = true;
-   m_weakPrice = brokenHigh.price;
-   m_weakTime  = brokenHigh.time;
+   m_hasWeak    = true;
+   m_weakPrice  = brokenHigh.price;
+   m_weakTime   = brokenHigh.time;
+   m_weakIsHigh = true;
    m_weakTrack.Push(m_data.CloseTime(b), m_weakPrice);
 
    m_trend = TT_TREND_BULL;
@@ -953,9 +989,10 @@ void CStructureEngine::ApplyBearBreak(const int b, const int loIdx, const TTSwin
    m_hasActHigh  = true;
    m_actHigh     = m_strongPrice;
    m_actHighTime = m_strongTime;
-   m_hasWeak   = true;
-   m_weakPrice = brokenLow.price;
-   m_weakTime  = brokenLow.time;
+   m_hasWeak    = true;
+   m_weakPrice  = brokenLow.price;
+   m_weakTime   = brokenLow.time;
+   m_weakIsHigh = false;
    m_weakTrack.Push(m_data.CloseTime(b), m_weakPrice);
 
    m_trend = TT_TREND_BEAR;

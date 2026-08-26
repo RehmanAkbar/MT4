@@ -72,7 +72,10 @@ struct TTSignal
    double            rr;
    int               quality;
    double            lots;
-   int               outcome;    // 0 open, 1 target hit, 2 stop hit, 3 missed
+   //--- 0 open, 1 target hit, 2 stop hit. A setup that expires without a
+   //--- pullback never becomes a TTSignal at all (MarkMissed runs before one
+   //--- is built), so there is no "missed" outcome to render here.
+   int               outcome;
   };
 
 //+------------------------------------------------------------------+
@@ -119,14 +122,29 @@ string TTTfLabel(const ENUM_TIMEFRAMES tf)
    return(IntegerToString(m / 43200) + "MN");
   }
 //+------------------------------------------------------------------+
+//| Chart background, cached. TTBlend() is called once per drawn      |
+//| object - several hundred times per redraw - and each call used to |
+//| issue its own ChartGetInteger. Refreshed once per redraw instead. |
+//+------------------------------------------------------------------+
+uint g_ttChartBg   = 0;
+bool g_ttBgLoaded  = false;
+
+void TTRefreshTheme(void)
+  {
+   g_ttChartBg  = (uint)ChartGetInteger(0, CHART_COLOR_BACKGROUND);
+   g_ttBgLoaded = true;
+  }
+//+------------------------------------------------------------------+
 //| MT5 rectangles have no alpha channel, so semi-transparency is     |
 //| emulated by mixing the fill colour into the chart background.     |
 //| alpha 0 = invisible, 1 = solid.                                   |
 //+------------------------------------------------------------------+
 color TTBlend(const color fg, const double alpha)
   {
+   if(!g_ttBgLoaded)
+      TTRefreshTheme();
    uint f  = (uint)fg;
-   uint bg = (uint)ChartGetInteger(0, CHART_COLOR_BACKGROUND);
+   uint bg = g_ttChartBg;
    double a = alpha;
    if(a < 0.0) a = 0.0;
    if(a > 1.0) a = 1.0;
@@ -235,12 +253,16 @@ void TTArrow(const string name, const datetime t, const double p, const int code
 //| MS / BOS markup: a thin line from the swing that was broken to    |
 //| the bar that broke it, with the label centred above it.           |
 //+------------------------------------------------------------------+
+//| `scope` distinguishes the bias engine's markup from the setup     |
+//| engine's. Without it, running BiasTF == SetupTF makes both books  |
+//| emit the same object names and one silently overwrites the other. |
+//+------------------------------------------------------------------+
 void TTDrawStructEvent(const TTStructEvent &ev, const ENUM_TIMEFRAMES tf,
-                       const TTDrawCfg &cfg)
+                       const string scope, const TTDrawCfg &cfg)
   {
    if(ev.isBOS ? !cfg.showBOS : !cfg.showMS)
       return;
-   string id  = TTTfLabel(tf) + "_" + IntegerToString((long)ev.breakTime);
+   string id  = scope + TTTfLabel(tf) + "_" + IntegerToString((long)ev.breakTime);
    string ln  = TTObjName("E", id);
    string tx  = TTObjName("ET", id);
    TTSegment(ln, ev.swingTime, ev.price, ev.breakTime, ev.price,
@@ -263,9 +285,12 @@ void TTDrawStructEvent(const TTStructEvent &ev, const ENUM_TIMEFRAMES tf,
 //| so they stay visible until price interacts with them; a zone that |
 //| failed is frozen at its invalidation bar and greyed out.          |
 //+------------------------------------------------------------------+
-void TTDrawZone(const TTZone &z, const TTDrawCfg &cfg)
+//| `scope` is required for the same reason as on TTDrawStructEvent:  |
+//| zone ids are per-book, so two books on the same timeframe collide. |
+//+------------------------------------------------------------------+
+void TTDrawZone(const TTZone &z, const string scope, const TTDrawCfg &cfg)
   {
-   string id   = TTTfLabel(z.tf) + "_" + IntegerToString(z.id);
+   string id   = scope + TTTfLabel(z.tf) + "_" + IntegerToString(z.id);
    string name = TTObjName("Z", id);
 
    datetime right = (datetime)((long)z.createdTime + (long)PeriodSeconds(z.tf) * cfg.extendZonesBars);
@@ -348,7 +373,7 @@ void TTDrawLiquidity(const TTLiqPool &p, const ENUM_TIMEFRAMES tf, const TTDrawC
 void TTDrawStrongWeak(const ENUM_TIMEFRAMES tf, const bool hasStrong, const double strongPrice,
                       const datetime strongTime, const bool strongIsLow,
                       const bool hasWeak, const double weakPrice, const datetime weakTime,
-                      const TTDrawCfg &cfg)
+                      const bool weakIsHigh, const TTDrawCfg &cfg)
   {
    if(!cfg.showStrongWeak)
       return;
@@ -369,8 +394,11 @@ void TTDrawStrongWeak(const ENUM_TIMEFRAMES tf, const bool hasStrong, const doub
       string id = lbl + "_WEAK";
       TTSegment(TTObjName("SW", id), weakTime, weakPrice, right, weakPrice,
                 cfg.clrStrongWeak, STYLE_DASH, 1, true);
+      //--- labelled from the weak level's OWN recorded side, not inferred from
+      //--- strongIsLow: a weak level can exist before any strong one does, and
+      //--- strongIsLow's default would then label it backwards
       TTText(TTObjName("SWT", id), right, weakPrice,
-             lbl + " Weak " + (strongIsLow ? "High" : "Low"),
+             lbl + " Weak " + (weakIsHigh ? "High" : "Low"),
              cfg.clrStrongWeak, cfg.fontSize, ANCHOR_RIGHT);
      }
   }
@@ -407,7 +435,6 @@ void TTDrawSignal(const TTSignal &s, const datetime anchor, const TTDrawCfg &cfg
                              s.aggressive ? "AGG" : "CON", s.rr, s.quality, s.lots);
    if(s.outcome == 1) txt += "  [TP]";
    if(s.outcome == 2) txt += "  [SL]";
-   if(s.outcome == 3) txt += "  [MISSED]";
    TTText(TTObjName("SIGT", id), anchor, s.entry, txt, dirClr, cfg.fontSize,
           s.bullish ? ANCHOR_LEFT_UPPER : ANCHOR_LEFT_LOWER);
 

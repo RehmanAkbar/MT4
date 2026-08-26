@@ -36,13 +36,15 @@
 //| SIGNAL BAR's own time so a history rebuild reaches the same       |
 //| verdict the live run did.                                         |
 //+------------------------------------------------------------------+
+//--- Throttling (signals per day, bars between signals) is NOT here: it lives
+//--- in CSignalGovernor, which owns the counters that enforce it. Mirroring
+//--- those inputs into this struct as well left two copies where only one was
+//--- ever read.
 struct TTFilterCfg
   {
    bool              useSession;
    int               sessionStartHour;    // server time
    int               sessionEndHour;      // server time, exclusive
-   int               maxSignalsPerDay;    // 0 = unlimited
-   int               minBarsBetweenSignals;
    int               avoidMinutes;        // 0 = blackout list disabled
    string            blackoutCsv;         // "HH:MM,HH:MM,..." server time
   };
@@ -110,7 +112,14 @@ double TTNormalizeVolume(const string sym, const double lots)
 //| Money per lot per unit of price = TICK_VALUE / TICK_SIZE. Using   |
 //| that ratio rather than a hardcoded pip value is what makes this   |
 //| correct on gold, indices and FX alike, whatever the digits.       |
-//| Returns 0 when the broker has not published usable contract data. |
+//|                                                                   |
+//| Returns 0 when the broker has not published usable contract data, |
+//| AND when the requested risk does not buy even one minimum lot.    |
+//| Rounding that case UP to VOLUME_MIN is what a naive sizer does,   |
+//| and it silently turns 0.5% risk into 2% on a small account - the  |
+//| trader reads a lot size off the panel with no hint that it broke  |
+//| the risk budget. 0.00 lots says "this setup does not fit", which  |
+//| is the honest answer.                                             |
 //+------------------------------------------------------------------+
 double TTLotSize(const string sym, const double riskPercent, const double slDistance)
   {
@@ -128,7 +137,12 @@ double TTLotSize(const string sym, const double riskPercent, const double slDist
    double moneyPerLot = (slDistance / tickSize) * tickValue;
    if(moneyPerLot <= 0.0)
       return(0.0);
-   return(TTNormalizeVolume(sym, riskMoney / moneyPerLot));
+
+   double raw  = riskMoney / moneyPerLot;
+   double vmin = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   if(vmin > 0.0 && raw < vmin)
+      return(0.0);                               // one min lot already over-risks
+   return(TTNormalizeVolume(sym, raw));
   }
 //+------------------------------------------------------------------+
 //| Pushes the stop out to the broker's minimum stop distance when a  |

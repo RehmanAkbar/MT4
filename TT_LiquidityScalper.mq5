@@ -53,6 +53,7 @@
 #define TTLS_DRAW_MAX_EVENTS     18
 #define TTLS_DRAW_MAX_SIGNALS    40
 #define TTLS_DRAW_MAX_DEAD_ZONES 3
+#define TTLS_DRAW_MAX_LIQUIDITY  30
 //--- ATR period used for every adaptive tolerance in the package
 #define TTLS_ATR_PERIOD          14
 
@@ -90,7 +91,7 @@ input group "=== Timeframes ==="
 input ENUM_TIMEFRAMES InpBiasTF              = PERIOD_H1;   // BiasTF - directional filter
 input ENUM_TIMEFRAMES InpSetupTF             = PERIOD_M15;  // SetupTF - POIs, liquidity, sweeps
 input ENUM_TIMEFRAMES InpEntryTF             = PERIOD_M5;   // EntryTF - conservative trigger
-input int             InpMaxHistoryBars      = 2000;        // Max bars rebuilt per timeframe
+input int             InpMaxHistoryBars      = 2000;        // Max SetupTF bars rebuilt (other TFs matched by time)
 
 input group "=== Structure ==="
 input int             InpSwingLeftBars       = 3;      // SwingLeftBars
@@ -390,11 +391,12 @@ void InitConfigs(void)
    g_draw.showPanel       = InpShowInfoPanel;
    g_draw.corner          = InpPanelCorner;
 
+   //--- MaxSignalsPerDay / MinBarsBetweenSignals are deliberately NOT mirrored
+   //--- here: CSignalGovernor owns them (see InitEngines) and is the only
+   //--- thing that enforces them.
    g_filter.useSession            = InpUseSessionFilter;
    g_filter.sessionStartHour      = InpSessionStartHour;
    g_filter.sessionEndHour        = InpSessionEndHour;
-   g_filter.maxSignalsPerDay      = InpMaxSignalsPerDay;
-   g_filter.minBarsBetweenSignals = InpMinBarsBetweenSignals;
    g_filter.avoidMinutes          = InpAvoidHighImpactMinutes;
    g_filter.blackoutCsv           = InpBlackoutTimes;
   }
@@ -478,12 +480,41 @@ bool UpdateAllEngines(const bool rebuild)
    return(true);
   }
 //+------------------------------------------------------------------+
+//| How deep to rebuild one timeframe.                                |
+//|                                                                   |
+//| MaxHistoryBars counts SETUP timeframe bars; every other timeframe |
+//| is given whatever bar count covers the SAME WALL-CLOCK SPAN.      |
+//|                                                                   |
+//| Applying one bar count to all three was a repaint hole, not just  |
+//| a tuning wart. At the defaults it gave EntryTF 2000 M5 bars = 7   |
+//| days while the SetupTF loop walked 2000 M15 bars = 20 days, so    |
+//| for every SetupTF bar older than 7 days the EntryTF event ring    |
+//| was simply empty: FirstShiftAfter() found nothing, the setup sat  |
+//| in SWEPT until its protected level broke, and conservative-mode   |
+//| signals the live run had fired could not be reproduced by a       |
+//| reload. Matching the spans makes the three engines cover the same |
+//| stretch of market, which is what the cross-timeframe queries      |
+//| already assumed.                                                  |
+//+------------------------------------------------------------------+
+int TTHistoryBarsFor(const ENUM_TIMEFRAMES tf)
+  {
+   int setupSec = PeriodSeconds(InpSetupTF);
+   int tfSec    = PeriodSeconds(tf);
+   if(setupSec <= 0 || tfSec <= 0)
+      return(InpMaxHistoryBars);
+   long bars = ((long)InpMaxHistoryBars * (long)setupSec) / (long)tfSec;
+   //--- the same clamp BeginUpdate() applies, so the caller sees no surprises
+   if(bars < 200)   bars = 200;
+   if(bars > 20000) bars = 20000;
+   return((int)bars);
+  }
+//+------------------------------------------------------------------+
 //| Bias and entry timeframes: structure + zones, no state machine.   |
 //+------------------------------------------------------------------+
 bool UpdateSimpleTf(CStructureEngine &st, CZoneBook &zb, const bool rebuild)
   {
    int startB = 0;
-   if(!st.BeginUpdate(rebuild, InpMaxHistoryBars, startB))
+   if(!st.BeginUpdate(rebuild, TTHistoryBarsFor(st.Tf()), startB))
       return(false);
    if(st.DidReset())
       zb.Reset();
@@ -522,7 +553,7 @@ bool UpdateSimpleTf(CStructureEngine &st, CZoneBook &zb, const bool rebuild)
 bool UpdateSetupTf(const bool rebuild)
   {
    int startB = 0;
-   if(!g_stSetup.BeginUpdate(rebuild, InpMaxHistoryBars, startB))
+   if(!g_stSetup.BeginUpdate(rebuild, TTHistoryBarsFor(InpSetupTF), startB))
       return(false);
    if(g_stSetup.DidReset())
       ResetSetupState();
@@ -544,8 +575,12 @@ bool UpdateSetupTf(const bool rebuild)
       for(int f = 0; f < g_stSetup.FreshCount(); f++)
         {
          TTSwing s;
+         //--- bc is the close of the bar that CONFIRMED the swing, i.e. the
+         //--- instant the pool became visible; the pool stores it so a
+         //--- historical target query cannot reach for a level nobody could
+         //--- have seen yet
          if(g_stSetup.Fresh(f, s))
-            g_liq.OnSwingConfirmed(s, d.ATR(b));
+            g_liq.OnSwingConfirmed(s, d.ATR(b), bc);
         }
 
       g_zoneSetup.PhaseUpdateStates(b);
@@ -584,10 +619,13 @@ void ResetSetupState(void)
    g_trackBear.Reset();
    ResetCtx(g_bull);
    ResetCtx(g_bear);
-   g_bull.bullish  = true;
-   g_bear.bullish  = false;
-   g_signalCount   = 0;
-   g_lastAlertTime = 0;
+   g_bull.bullish   = true;
+   g_bear.bullish   = false;
+   g_signalCount    = 0;
+   //--- both alert watermarks, not just one: leaving the sweep watermark set
+   //--- muted the first sweep alert after every rebuild
+   g_lastAlertTime  = 0;
+   g_lastSweepAlert = 0;
   }
 //+------------------------------------------------------------------+
 //| Keeps the swing ring's swept flags in step with the pool that     |
@@ -795,12 +833,50 @@ void AdvanceConservative(TTSetupCtx &ctx, const datetime upto)
          return;
       ctx.shiftSearchFrom = ev.breakClose;       // a rejected shift is never retried
       TTZone z;
-      if(!g_zoneEntry.FindByEvent(ev.breakTime, ctx.bullish, z))
+      if(!ResolveShiftZone(ctx, ev, z))
          return;                                 // no zone behind it - wait for the next
       if(!ArmPending(ctx, ev, z))
          return;
      }
    ScanPullback(ctx, upto);
+  }
+//+------------------------------------------------------------------+
+//| The zone behind an LTF shift.                                     |
+//|                                                                   |
+//| FindByEvent() matches on identity - the zone still carrying this  |
+//| break's event time - which is right when the break built its own  |
+//| box. But CZoneBook::AddZone MERGES a new box into an overlapping  |
+//| live one and the survivor keeps the OLDER event time, so nothing  |
+//| carries this event at all. That is not a rare corner: two breaks  |
+//| in one impulse routinely walk back to the same origin candle and  |
+//| produce an identical box. The old code returned false there, and  |
+//| because shiftSearchFrom had already advanced past the shift, the  |
+//| setup was discarded outright - conservative mode quietly dropped  |
+//| a large share of its entries.                                     |
+//|                                                                   |
+//| So: try identity first, then fall back to the nearest live zone   |
+//| on the ORIGIN side of the break, as the book stood when the break |
+//| closed. That is the merged box in practice, and the asOf bound    |
+//| keeps the fallback free of hindsight.                             |
+//+------------------------------------------------------------------+
+bool ResolveShiftZone(TTSetupCtx &ctx, const TTStructEvent &ev, TTZone &z)
+  {
+   if(g_zoneEntry.FindByEvent(ev.breakTime, ctx.bullish, z))
+      return(true);
+
+   for(int rank = 0; rank < g_maxZones; rank++)
+     {
+      TTZone c;
+      if(!g_zoneEntry.NearestLive(rank, ev.price, ctx.bullish, ev.breakClose, c))
+         break;
+      //--- demand must sit at or below the level that broke, supply at or above
+      if(ctx.bullish ? (c.bottom <= ev.price) : (c.top >= ev.price))
+        {
+         z = c;
+         return(true);
+        }
+     }
+   return(false);
   }
 //+------------------------------------------------------------------+
 //| Arms a pending entry at the proximal edge of the LTF shift zone.  |
@@ -1012,7 +1088,12 @@ void FireSignal(TTSetupCtx &ctx, const bool aggressive, const double entry,
      {
       TTFilterCfg sessionScore = g_filter;
       sessionScore.useSession  = true;            // score the session even when not filtering
-      sig.quality = TTQualityScore(true, ctx.sweepInside, ctx.zoneUntested,
+      //--- read the alignment back rather than passing a literal true: the bias
+      //--- gate should guarantee it, and if it ever stops doing so the score
+      //--- should say so instead of awarding the points regardless
+      int  want    = ctx.bullish ? (int)TT_TREND_BULL : (int)TT_TREND_BEAR;
+      bool aligned = (g_stBias.TrendAt(bc) == want && g_stSetup.TrendAt(bc) == want);
+      sig.quality = TTQualityScore(aligned, ctx.sweepInside, ctx.zoneUntested,
                                    ctx.poolCount > 1, sig.rr,
                                    TTSessionOk(barTime, sessionScore));
       sig.lots = InpShowLotSize
@@ -1049,6 +1130,11 @@ void StoreSignal(const TTSignal &sig)
      }
    g_signals[g_signalCount] = sig;
    g_signalCount++;
+   //--- a conservative signal can fire from the tail catch-up, outside the
+   //--- SetupTF bar loop that normally raises this. Without it the arrow and
+   //--- the SL/TP boxes stayed invisible until the next SetupTF bar closed,
+   //--- even though the buffers and the alert had already gone out.
+   g_dirty = true;
   }
 //+------------------------------------------------------------------+
 //| Resolves what happened to earlier signals using SetupTF bars.     |
@@ -1145,16 +1231,19 @@ int SignalChartIndex(const TTSignal &sig)
 //+------------------------------------------------------------------+
 void RedrawMarkup(void)
   {
+   TTRefreshTheme();                              // one background read per redraw
    TTDeleteAll();
-   DrawTfMarkup(g_stBias, g_zoneBias, InpBiasTF, true);
-   DrawTfMarkup(g_stSetup, g_zoneSetup, InpSetupTF, false);
+   //--- the scope tags keep the two books' object names apart when a user runs
+   //--- BiasTF == SetupTF; zone ids are per-book and would otherwise collide
+   DrawTfMarkup(g_stBias, g_zoneBias, InpBiasTF, "B", true);
+   DrawTfMarkup(g_stSetup, g_zoneSetup, InpSetupTF, "S", false);
    DrawLiquidity();
    DrawSignals();
    ChartRedraw();
   }
 //+------------------------------------------------------------------+
 void DrawTfMarkup(CStructureEngine &st, CZoneBook &zb, const ENUM_TIMEFRAMES tf,
-                  const bool withStrongWeak)
+                  const string scope, const bool withStrongWeak)
   {
    CEventRing *ev = st.Events();
    int n = (int)MathMin(ev.Count(), TTLS_DRAW_MAX_EVENTS);
@@ -1162,14 +1251,14 @@ void DrawTfMarkup(CStructureEngine &st, CZoneBook &zb, const ENUM_TIMEFRAMES tf,
      {
       TTStructEvent e;
       if(ev.Get(i, e))
-         TTDrawStructEvent(e, tf, g_draw);
+         TTDrawStructEvent(e, tf, scope, g_draw);
      }
-   DrawZonesFor(zb, tf, true);
-   DrawZonesFor(zb, tf, false);
+   DrawZonesFor(zb, tf, scope, true);
+   DrawZonesFor(zb, tf, scope, false);
    if(withStrongWeak)
       TTDrawStrongWeak(tf, st.HasStrong(), st.StrongPrice(), st.StrongTime(),
                        st.StrongIsLow(), st.HasWeak(), st.WeakPrice(), st.WeakTime(),
-                       g_draw);
+                       st.WeakIsHigh(), g_draw);
   }
 //+------------------------------------------------------------------+
 //+------------------------------------------------------------------+
@@ -1181,7 +1270,8 @@ void DrawTfMarkup(CStructureEngine &st, CZoneBook &zb, const ENUM_TIMEFRAMES tf,
 //| produce a signal. Failed zones stay on for a while, greyed, so    |
 //| it is still visible WHY a level stopped working.                  |
 //+------------------------------------------------------------------+
-void DrawZonesFor(CZoneBook &zb, const ENUM_TIMEFRAMES tf, const bool bullish)
+void DrawZonesFor(CZoneBook &zb, const ENUM_TIMEFRAMES tf, const string scope,
+                  const bool bullish)
   {
    double   px  = SymbolInfoDouble(g_sym, SYMBOL_BID);
    datetime now = TimeCurrent();
@@ -1193,7 +1283,7 @@ void DrawZonesFor(CZoneBook &zb, const ENUM_TIMEFRAMES tf, const bool bullish)
       TTZone z;
       if(!zb.NearestLive(rank, px, bullish, now, z))
          break;
-      TTDrawZone(z, g_draw);
+      TTDrawZone(z, scope, g_draw);
      }
 
    //--- recently invalidated zones, capped so history cannot pile up
@@ -1208,14 +1298,20 @@ void DrawZonesFor(CZoneBook &zb, const ENUM_TIMEFRAMES tf, const bool bullish)
          continue;
       if(z.invalidTime < cutoff)
          continue;
-      TTDrawZone(z, g_draw);
+      TTDrawZone(z, scope, g_draw);
       shown++;
      }
   }
 //+------------------------------------------------------------------+
+//| Liquidity was the one renderer with no ceiling: up to 512 pools,  |
+//| two objects each, deleted and recreated on every new bar. Events, |
+//| signals and dead zones are all capped - this now matches them and |
+//| draws the newest pools, which are the ones still in play.         |
+//+------------------------------------------------------------------+
 void DrawLiquidity(void)
   {
-   for(int i = 0; i < g_liq.Count(); i++)
+   int from = (int)MathMax(0, g_liq.Count() - TTLS_DRAW_MAX_LIQUIDITY);
+   for(int i = from; i < g_liq.Count(); i++)
      {
       TTLiqPool p;
       if(g_liq.Get(i, p))
@@ -1301,7 +1397,6 @@ void UpdatePanel(void)
       string res = "open";
       if(s.outcome == 1) res = "TP";
       if(s.outcome == 2) res = "SL";
-      if(s.outcome == 3) res = "missed";
       info.lastResult = dir + " " + res;
      }
    info.note = g_lossBreached

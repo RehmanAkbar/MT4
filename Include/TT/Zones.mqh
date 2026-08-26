@@ -103,6 +103,15 @@ private:
    TTZone            m_zones[];
    int               m_count;
    int               m_nextId;
+   //--- NearestLive() scratch. Members rather than locals: the function is
+   //--- called O(maxActive) times per bar per direction, and two 512-slot
+   //--- stack arrays per call is ~6 KB of churn through a history rebuild.
+   int               m_selIdx[TTLS_MAX_ZONES];
+   double            m_selDist[TTLS_MAX_ZONES];
+   //--- was this zone already dead at time `asOf`? State flags describe TODAY;
+   //--- a historical query has to ask what was true THEN or it reads the
+   //--- future - see the note on NearestLive().
+   bool              DeadAt(const int i, const datetime asOf);
 
    void              Compact(void);
    int               FindOriginCandle(const int b, const bool bullish);
@@ -328,11 +337,26 @@ void CZoneBook::AddZone(const double top, const double bottom, const datetime cr
    if(ov >= 0)
      {
       //--- merge into the larger box, keeping the older origin as the anchor
-      m_zones[ov].top    = MathMax(m_zones[ov].top, top);
-      m_zones[ov].bottom = MathMin(m_zones[ov].bottom, bottom);
+      double newTop = MathMax(m_zones[ov].top, top);
+      double newBot = MathMin(m_zones[ov].bottom, bottom);
+      bool   grew   = (newTop > m_zones[ov].top || newBot < m_zones[ov].bottom);
+      m_zones[ov].top    = newTop;
+      m_zones[ov].bottom = newBot;
       if(created < m_zones[ov].createdTime)
          m_zones[ov].createdTime = created;
       m_zones[ov].untestedExtreme = (m_zones[ov].untestedExtreme || untested);
+      //--- A box that just GREW is not the box price interacted with. Carrying
+      //--- the old TOUCHED/MITIGATED flag across would let TryArmPoi arm on a
+      //--- level that was never traded into in its current shape, so the life
+      //--- cycle restarts. If price is genuinely inside the new box the next
+      //--- bar's PhaseUpdateStates re-touches it - the cost is one bar, not a
+      //--- lost setup.
+      if(grew)
+        {
+         m_zones[ov].state        = TTZS_LIVE;
+         m_zones[ov].touchTime    = 0;
+         m_zones[ov].mitigateTime = 0;
+        }
       return;
      }
 
@@ -485,16 +509,25 @@ void CZoneBook::PhaseUpdateStates(const int b)
       AddZone(brkTop[j], brkBot[j], bt, bt, TTZ_BREAKER, brkBull[j], false);
   }
 //+------------------------------------------------------------------+
+//| A zone is dead at asOf only if it was ALREADY invalidated by then. |
+//| StepZone() stamps invalidTime on every transition to TTZS_INVALID, |
+//| so this is exact rather than a heuristic on the current state.     |
+//+------------------------------------------------------------------+
+bool CZoneBook::DeadAt(const int i, const datetime asOf)
+  {
+   return(m_zones[i].invalidTime != 0 && m_zones[i].invalidTime <= asOf);
+  }
+//+------------------------------------------------------------------+
 int CZoneBook::LiveCount(const bool bullish, const datetime asOf)
   {
    int n = 0;
    for(int i = 0; i < m_count; i++)
      {
-      if(m_zones[i].bullish != bullish || m_zones[i].state == TTZS_INVALID)
+      if(m_zones[i].bullish != bullish)
          continue;
       if(m_zones[i].eventTime > asOf)
          continue;
-      if(m_zones[i].invalidTime != 0 && m_zones[i].invalidTime <= asOf)
+      if(DeadAt(i, asOf))
          continue;
       n++;
      }
@@ -504,6 +537,15 @@ int CZoneBook::LiveCount(const bool bullish, const datetime asOf)
 //| Zones are ranked outward from the current price. Only the nearest |
 //| MaxActiveZones per direction are considered live, which stops a   |
 //| stale zone 300 points away from arming a scalp.                   |
+//|                                                                   |
+//| BOTH bounds are evaluated AS OF `asOf`, never against the current |
+//| flags: eventTime gates what was already known, invalidTime gates  |
+//| what had already failed. Filtering on state == TTZS_INVALID would |
+//| hide a zone from a historical query because of something that     |
+//| happened after it - look-ahead, and the exact repaint this file   |
+//| exists to prevent. Inside the forward bar walk the two are        |
+//| equivalent; on the conservative tail path, where asOf trails the  |
+//| book, they are not.                                               |
 //+------------------------------------------------------------------+
 bool CZoneBook::NearestLive(const int rank, const double price, const bool bullish,
                             const datetime asOf, TTZone &out)
@@ -511,15 +553,14 @@ bool CZoneBook::NearestLive(const int rank, const double price, const bool bulli
    if(rank < 0 || rank >= m_cfg.maxActive)
       return(false);
 
-   int    idx[TTLS_MAX_ZONES];
-   double dist[TTLS_MAX_ZONES];
-   int    n = 0;
-
+   int n = 0;
    for(int i = 0; i < m_count && n < TTLS_MAX_ZONES; i++)
      {
-      if(m_zones[i].bullish != bullish || m_zones[i].state == TTZS_INVALID)
+      if(m_zones[i].bullish != bullish)
          continue;
       if(m_zones[i].eventTime > asOf)            // not known yet at that moment
+         continue;
+      if(DeadAt(i, asOf))                        // had already failed by then
          continue;
       //--- distance from price to the near edge of the box (0 when price is inside)
       double d = 0.0;
@@ -528,8 +569,8 @@ bool CZoneBook::NearestLive(const int rank, const double price, const bool bulli
       else
          if(price < m_zones[i].bottom)
             d = m_zones[i].bottom - price;
-      idx[n]  = i;
-      dist[n] = d;
+      m_selIdx[n]  = i;
+      m_selDist[n] = d;
       n++;
      }
    if(rank >= n)
@@ -542,18 +583,19 @@ bool CZoneBook::NearestLive(const int rank, const double price, const bool bulli
       int best = r;
       for(int j = r + 1; j < n; j++)
         {
-         bool better = (dist[j] < dist[best]) ||
-                       (dist[j] == dist[best] && m_zones[idx[j]].id < m_zones[idx[best]].id);
+         bool better = (m_selDist[j] < m_selDist[best]) ||
+                       (m_selDist[j] == m_selDist[best] &&
+                        m_zones[m_selIdx[j]].id < m_zones[m_selIdx[best]].id);
          if(better)
             best = j;
         }
       if(best != r)
         {
-         int    ti = idx[r];  idx[r]  = idx[best];  idx[best] = ti;
-         double td = dist[r]; dist[r] = dist[best]; dist[best] = td;
+         int    ti = m_selIdx[r];  m_selIdx[r]  = m_selIdx[best];  m_selIdx[best] = ti;
+         double td = m_selDist[r]; m_selDist[r] = m_selDist[best]; m_selDist[best] = td;
         }
      }
-   out = m_zones[idx[rank]];
+   out = m_zones[m_selIdx[rank]];
    return(true);
   }
 
