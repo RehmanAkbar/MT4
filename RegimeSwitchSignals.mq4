@@ -20,6 +20,10 @@
    //|  - SL/TP lines, strength labels and X marks: drawn only within   |
    //|    InpSLTP_MaxAge, cleaned whenever shown, wiped on full recalc  |
    //|  - Buy entries include the spread for the newest signal too      |
+   //|  - EMA-cross alerts on closed bars only (the live branch could   |
+   //|    alert on a cross that undid, then alerted again on close)     |
+   //|  - MTF: full recalc once the higher timeframe's history loads or |
+   //|    is backfilled (on first load the veto silently passed)        |
    //|  v2.3 Improvements over v2.2:                                    |
    //|  - MTF causality fix: HTF ADX/ER now read the last CLOSED HTF    |
    //|    bar. Before, history used the HTF bar CONTAINING the local    |
@@ -355,6 +359,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
 
    //--- Higher timeframe
    int g_htfPeriod = 0;
+   int g_htfBarsSeen = 0;            // v2.4: HTF bar count at the previous call
 
    //--- v2.4: the per-bar state arrays above (g_bwCache, g_rawRegime, ...) are
    //    indexed by ABSOLUTE bar, 0 = oldest (see AbsIdx). MT4 shifts indicator
@@ -863,6 +868,14 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
          prevCalc = 0;
       g_absBaseTime = oldestTime;
       g_absTotal    = rates_total;
+
+      //--- v2.4: the MTF veto reads another timeframe's history, which may still be
+      //    downloading on first load (the veto then silently passes). Recalc once
+      //    that history arrives or is backfilled; a normal new HTF bar adds just 1.
+      int htfBarsNow = (InpUseMTF && g_htfPeriod > Period()) ? iBars(Symbol(), g_htfPeriod) : 0;
+      if(prevCalc > 0 && htfBarsNow > g_htfBarsSeen + 1)
+         prevCalc = 0;
+      g_htfBarsSeen = htfBarsNow;
 
       //--- v2.4: incremental calls evaluate only newly closed bars (0 on an intrabar
       //    tick). Re-evaluating bars 1..51 on every call existed to refresh the
@@ -1974,15 +1987,14 @@ void CheckAlerts()
 
    if(InpAlertEMACross)
    {
-      double emaFast0 = iMA(Symbol(), 0, InpEMA_Fast, 0, InpMA_Method, PRICE_CLOSE, 0);
-      double emaSlow0 = iMA(Symbol(), 0, InpEMA_Slow, 0, InpMA_Method, PRICE_CLOSE, 0);
+      //--- v2.4: closed-bar crosses only, like every other alert here. The old live
+      //    (bar 0) branch alerted on crosses that could still undo, and the same
+      //    cross alerted again on close (different event id, same bar time).
       double emaFast1 = iMA(Symbol(), 0, InpEMA_Fast, 0, InpMA_Method, PRICE_CLOSE, 1);
       double emaSlow1 = iMA(Symbol(), 0, InpEMA_Slow, 0, InpMA_Method, PRICE_CLOSE, 1);
       double emaFast2 = iMA(Symbol(), 0, InpEMA_Fast, 0, InpMA_Method, PRICE_CLOSE, 2);
       double emaSlow2 = iMA(Symbol(), 0, InpEMA_Slow, 0, InpMA_Method, PRICE_CLOSE, 2);
 
-      bool liveBull   = emaFast1 <= emaSlow1 && emaFast0 > emaSlow0;
-      bool liveBear   = emaFast1 >= emaSlow1 && emaFast0 < emaSlow0;
       bool closedBull = emaFast2 <= emaSlow2 && emaFast1 > emaSlow1;
       bool closedBear = emaFast2 >= emaSlow2 && emaFast1 < emaSlow1;
 
@@ -1990,21 +2002,7 @@ void CheckAlerts()
       datetime emaEventTime = 0;
       string emaMsg = "";
 
-      if(liveBull)
-      {
-         emaEventId = 1;
-         emaEventTime = iTime(Symbol(), 0, 0);
-         emaMsg = Symbol() + " " + PeriodStr() + " | EMA BULL CROSS ("
-                + IntegerToString(InpEMA_Fast) + "/" + IntegerToString(InpEMA_Slow) + ")";
-      }
-      else if(liveBear)
-      {
-         emaEventId = 2;
-         emaEventTime = iTime(Symbol(), 0, 0);
-         emaMsg = Symbol() + " " + PeriodStr() + " | EMA BEAR CROSS ("
-                + IntegerToString(InpEMA_Fast) + "/" + IntegerToString(InpEMA_Slow) + ")";
-      }
-      else if(closedBull)
+      if(closedBull)
       {
          emaEventId = 3;
          emaEventTime = iTime(Symbol(), 0, 1);
