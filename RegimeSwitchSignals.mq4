@@ -2,6 +2,15 @@
    //|                                    RegimeSwitchSignals_v2.mq4    |
    //|                    Regime-Switching Signal Indicator v2.1         |
    //|                                                                  |
+   //|  v2.4 Fixes over v2.3:                                           |
+   //|  - MR rejection: band/RSI extreme is read on the setup bar, the  |
+   //|    reversal candle on the next bar. The same-bar check needed an |
+   //|    opening gap (RSI only crosses up on an up-close), so MR       |
+   //|    almost never fired. NOT comparable with v2.3 backtests.       |
+   //|  - BO pullback: outer-band test moved to the break bar (on the   |
+   //|    pullback bar it made the EMA9 retest impossible)              |
+   //|  - MR EMA9 invalidator arms only after a close on the profitable |
+   //|    side of EMA9; flat exits are counted apart from open trades   |
    //|  v2.3 Improvements over v2.2:                                    |
    //|  - MTF causality fix: HTF ADX/ER now read the last CLOSED HTF    |
    //|    bar. Before, history used the HTF bar CONTAINING the local    |
@@ -44,7 +53,7 @@
    //|  - Trailing TP option for BO, BB-mid target for MR              |
    //+------------------------------------------------------------------+
    #property copyright "RegimeSwitchSignals v2"
-   #property version   "2.30"
+   #property version   "2.40"
    #property strict
    #property indicator_chart_window
    #property indicator_buffers 11
@@ -306,6 +315,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
    int g_wins   = 0;
    int g_losses = 0;
    int g_pending = 0;
+   int g_flat   = 0;                 // v2.4: MR trades closed flat by the EMA9 invalidator
 
    //--- Signal outcome tracking: +1=win, -1=loss, 0=pending/none
    int g_signalOutcome[];
@@ -411,12 +421,13 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
       g_wins   = 0;
       g_losses = 0;
       g_pending = 0;
+      g_flat   = 0;
       g_sltpCount = 0;
       g_rejRegime = 0; g_rejVolume = 0; g_rejDiv = 0; g_rejStrength = 0;
       g_rejCooldown = 0; g_rejPullback = 0; g_rejStack = 0; g_rejCost = 0;
       g_lastMaintBar = 0;
 
-      IndicatorShortName("RegimeSwitch Signals v2.3");
+      IndicatorShortName("RegimeSwitch Signals v2.4");
       return(INIT_SUCCEEDED);
    }
 
@@ -843,6 +854,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
          g_wins = 0;
          g_losses = 0;
          g_pending = 0;
+         g_flat = 0;
          g_rejRegime = 0; g_rejVolume = 0; g_rejDiv = 0; g_rejStrength = 0;
          g_rejCooldown = 0; g_rejPullback = 0; g_rejStack = 0; g_rejCost = 0;
       }
@@ -1042,7 +1054,23 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
 
          if(regime == REGIME_RANGE)
          {
-            int sig = MeanReversionSignal(iOpen(Symbol(), 0, i), cls, rsi, rsiPrev, bbUp, bbLo);
+            //--- v2.4: with InpMR_RequireRejection the band/RSI extreme is read on the
+            //    PREVIOUS bar (setup) and the reversal candle on THIS bar (trigger).
+            //    The same-bar version could not pass: RSI only crosses up into OB on an
+            //    up-close, so a bearish body on that bar needed an opening gap.
+            int    setupBar     = InpMR_RequireRejection ? i + 1 : i;
+            double setupCls     = cls, setupRsi = rsi, setupRsiPrev = rsiPrev;
+            double setupBBUp    = bbUp, setupBBLo = bbLo;
+            if(setupBar != i)
+            {
+               setupCls     = iClose(Symbol(), 0, setupBar);
+               setupRsi     = rsiPrev;
+               setupRsiPrev = iRSI(Symbol(), 0, InpRSI_Period, PRICE_CLOSE, setupBar + 1);
+               setupBBUp    = iBands(Symbol(), 0, InpBB_Period, InpBB_Dev, 0, PRICE_CLOSE, MODE_UPPER, setupBar);
+               setupBBLo    = iBands(Symbol(), 0, InpBB_Period, InpBB_Dev, 0, PRICE_CLOSE, MODE_LOWER, setupBar);
+            }
+            int sig = MeanReversionSignal(setupCls, setupRsi, setupRsiPrev, setupBBUp, setupBBLo,
+                                          iOpen(Symbol(), 0, i), cls);
             if(sig != 0)
             {
                //--- Volume filter
@@ -1056,7 +1084,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                int div = 0;
                if(sig != 0 && (InpMR_RequireDiv || InpMR_DivBoost))
                {
-                  div = DetectRSIDivergence(i, InpDiv_Lookback);
+                  div = DetectRSIDivergence(setupBar, InpDiv_Lookback);
                   if(InpMR_RequireDiv)
                   {
                      // For buy, need bullish div; for sell, need bearish div
@@ -1068,7 +1096,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                //--- Signal strength
                if(sig != 0)
                {
-                  double strength = CalcMRStrength(cls, rsi, bbUp, bbLo, atr, volRatio, div, er);
+                  double strength = CalcMRStrength(setupCls, setupRsi, setupBBUp, setupBBLo, atr, volRatio, div, er);
                   g_signalStrength[i] = strength;
 
                   if(strength < InpMinStrength)
@@ -1142,7 +1170,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                   int rawSig = BreakoutSignal(cls, iHigh(Symbol(), 0, i), iLow(Symbol(), 0, i), rsi, atr, emaF, emaS, diP, diM, bbUp, bbLo,
                                               boHiHigh, boLoLow);
                   sig = BreakoutPullbackSignal(i, cls, rsi, atr, emaF, emaS, ema9v,
-                                               diP, diM, bbUp, bbLo);
+                                               diP, diM);
                   if(rawSig != 0 && sig == 0) g_rejPullback++;
                }
                else
@@ -1294,9 +1322,14 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
    }
 
    //+------------------------------------------------------------------+
-   //| MEAN-REVERSION SIGNAL (unchanged logic)                          |
+   //| MEAN-REVERSION SIGNAL                                            |
+   //|   cls/rsi/rsiPrev/bbUp/bbLo: the setup bar (band + RSI extreme)  |
+   //|   trigOpen/trigClose: the trigger bar, checked for the reversal  |
+   //|   candle when InpMR_RequireRejection is on (v2.4: the bar after  |
+   //|   the setup; without the option both are the same bar)           |
    //+------------------------------------------------------------------+
-   int MeanReversionSignal(double opn, double cls, double rsi, double rsiPrev, double bbUp, double bbLo)
+   int MeanReversionSignal(double cls, double rsi, double rsiPrev, double bbUp, double bbLo,
+                           double trigOpen, double trigClose)
    {
       double bbRange = bbUp - bbLo;
       if(bbRange <= 0) return 0;
@@ -1305,13 +1338,13 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
       if(bbPos >= InpMR_BB_Touch && rsi >= InpMR_RSI_OB)
       {
          if(InpRequireRSICross && rsiPrev >= InpMR_RSI_OB) return 0;
-         if(InpMR_RequireRejection && cls >= opn) return 0;  // v2.2: need bearish rejection candle
+         if(InpMR_RequireRejection && trigClose >= trigOpen) return 0;  // v2.2: need bearish rejection candle
          return -1;
       }
       if(bbPos <= (1.0 - InpMR_BB_Touch) && rsi <= InpMR_RSI_OS)
       {
          if(InpRequireRSICross && rsiPrev <= InpMR_RSI_OS) return 0;
-         if(InpMR_RequireRejection && cls <= opn) return 0;  // v2.2: need bullish rejection candle
+         if(InpMR_RequireRejection && trigClose <= trigOpen) return 0;  // v2.2: need bullish rejection candle
          return +1;
       }
       return 0;
@@ -1345,14 +1378,15 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
    //| v2.1: BREAKOUT PULLBACK SIGNAL                                   |
    //|   Fires on a retest of EMA9 within InpBO_PullbackMaxBars after   |
    //|   a confirmed range break. Returns +1/-1/0.                      |
-   //|   Requires: a break bar in the recent past, current bar near     |
-   //|   EMA9 (within tolerance), price still on the break side of the  |
-   //|   broken level, EMA stack still aligned, momentum RSI still on   |
-   //|   the right side, and DI alignment intact.                       |
+   //|   Requires: a break bar in the recent past (closed beyond the    |
+   //|   range and the outer band), current bar near EMA9 (within       |
+   //|   tolerance), price still on the break side of the broken level, |
+   //|   EMA stack still aligned, momentum RSI still on the right side, |
+   //|   and DI alignment intact.                                       |
    //+------------------------------------------------------------------+
    int BreakoutPullbackSignal(int shift, double cls, double rsi, double atr,
                               double emaF, double emaS, double ema9v,
-                              double diP, double diM, double bbUp, double bbLo)
+                              double diP, double diM)
    {
       if(atr < _Point) return 0;
       double tol = InpBO_PullbackTolATR * atr;
@@ -1376,15 +1410,20 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
          double bLo = iLow (Symbol(), 0,
                               iLowest (Symbol(), 0, MODE_LOW,  InpBO_LookbackBars, bStart));
          double clsB = iClose(Symbol(), 0, br);
+         //--- v2.4: the outer-band test belongs to the BREAK bar. On the pullback bar it
+         //    contradicted the EMA9 retest (a close within tolerance of EMA9 and beyond
+         //    the outer band never coexist), so pullback mode could not fire.
+         double bbUpB = iBands(Symbol(), 0, InpBB_Period, InpBB_Dev, 0, PRICE_CLOSE, MODE_UPPER, br);
+         double bbLoB = iBands(Symbol(), 0, InpBB_Period, InpBB_Dev, 0, PRICE_CLOSE, MODE_LOWER, br);
 
          //--- Bullish pullback: prior bar broke up, price is still above the broken high
          //    (we're not back inside the range), EMA stack intact, momentum still bullish.
-         if(clsB > bHi + bufB && cls > bHi && cls > bbUp && emaF > emaS
+         if(clsB > bHi + bufB && clsB > bbUpB && cls > bHi && emaF > emaS
             && diP > diM && rsi > InpBO_Momentum_RSI)
             return +1;
 
          //--- Bearish pullback: mirror.
-         if(clsB < bLo - bufB && cls < bLo && cls < bbLo && emaF < emaS
+         if(clsB < bLo - bufB && clsB < bbLoB && cls < bLo && emaF < emaS
             && diM > diP && rsi < (100.0 - InpBO_Momentum_RSI))
             return -1;
       }
@@ -1490,6 +1529,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
       g_wins   = 0;
       g_losses = 0;
       g_pending = 0;
+      g_flat   = 0;
 
       int lookback = MathMin(InpWL_MaxLookback, totalBars - 2);
 
@@ -1535,7 +1575,9 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
          int execShift = MathMax(i - 1, 0);
 
          //--- Walk forward from entry bar to check outcome
-         int outcome = 0;  // 0=pending
+         int  outcome   = 0;      // 0=pending
+         bool flatExit  = false;  // v2.4: closed flat by the EMA9 invalidator
+         bool ema9Armed = false;
          for(int j = execShift; j >= 1 && j >= i - InpWL_MaxLookback; j--)
          {
             double hi = iHigh(Symbol(), 0, j);
@@ -1556,16 +1598,23 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
 
             //--- v2.1: MR EMA9 invalidator — close on the wrong side of EMA9
             //          counts as exit BEFORE SL/TP if it happens first.
+            //    v2.4: an MR entry starts on the far side of EMA9 by construction, so
+            //          the old test fired on the entry bar ~99% of the time. Arm it only
+            //          after a close on the profitable side of EMA9; a later close back
+            //          through is the exit.
             if(module == 1 && InpMR_UseEMA9Invalidator)
             {
                double clsJ  = iClose(Symbol(), 0, j);
                double ema9J = iMA(Symbol(), 0, InpEMA9_Period, 0, InpMA_Method, PRICE_CLOSE, j);
-               bool   thru  = (direction > 0 && clsJ < ema9J) ||
-                              (direction < 0 && clsJ > ema9J);
-               if(thru && !slHit && !tpHit)
+               bool   favorable = (direction > 0 && clsJ > ema9J) ||
+                                  (direction < 0 && clsJ < ema9J);
+               if(favorable)
+                  ema9Armed = true;
+               else if(ema9Armed && !slHit && !tpHit)
                {
                   // Treat as breakeven exit — neither win nor loss.
-                  outcome = 0;
+                  outcome  = 0;
+                  flatExit = true;
                   break;
                }
             }
@@ -1587,6 +1636,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
 
          if(outcome > 0) g_wins++;
          else if(outcome < 0) g_losses++;
+         else if(flatExit) g_flat++;
          else g_pending++;
 
          //--- Signal invalidation: gray out losing arrows
@@ -2098,7 +2148,9 @@ void CheckAlerts()
          CreateLabel(g_prefix + "wlW", innerX + 4, y, IntegerToString(g_wins) + "W", C'0,190,130', 9, true);
          CreateLabel(g_prefix + "wlD", innerX + 50, y, "/", C'100,110,130', 9, false);
          CreateLabel(g_prefix + "wlL", innerX + 62, y, IntegerToString(g_losses) + "L", C'220,80,80', 9, true);
-         CreateLabel(g_prefix + "wlP", innerX + 110, y, "(" + IntegerToString(g_pending) + " open)", C'100,110,130', 7, false);
+         string openTxt = "(" + IntegerToString(g_pending) + " open";
+         if(InpMR_UseEMA9Invalidator) openTxt += ", " + IntegerToString(g_flat) + " flat";   // v2.4
+         CreateLabel(g_prefix + "wlP", innerX + 110, y, openTxt + ")", C'100,110,130', 7, false);
          y += lineH;
 
          CreateLabel(g_prefix + "wrL", innerX + 4, y, "Win Rate", dimClr, 8, false);
