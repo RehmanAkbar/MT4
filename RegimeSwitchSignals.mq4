@@ -24,6 +24,14 @@
    //|    alert on a cross that undid, then alerted again on close)     |
    //|  - MTF: full recalc once the higher timeframe's history loads or |
    //|    is backfilled (on first load the veto silently passed)        |
+   //|  - Panel REJECTED: new 'rng' counter for breakouts blocked by    |
+   //|    the consolidation-range filter (InpBO_Min/MaxRangeATR), which |
+   //|    rejected silently                                             |
+   //|  - BO strength: ADX part floored at 0 (it went negative below    |
+   //|    InpADX_RangeThresh, penalising squeeze breakouts)             |
+   //|  - Win/loss covers 500 bars by default, the same window as the   |
+   //|    signal counts, and the panel shows the window; sells now pay  |
+   //|    the spread at exit like buys pay it on entry                  |
    //|  v2.3 Improvements over v2.2:                                    |
    //|  - MTF causality fix: HTF ADX/ER now read the last CLOSED HTF    |
    //|    bar. Before, history used the HTF bar CONTAINING the local    |
@@ -230,7 +238,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
    //--- NEW: Win/Loss tracking
    input string   __winloss__        = "══════ Win/Loss Tracker ══════";
    input bool     InpTrackWinLoss    = true;         // Track historical SL/TP outcomes
-   input int      InpWL_MaxLookback  = 200;          // Max bars to look back for outcome resolution
+   input int      InpWL_MaxLookback  = 500;          // Max bars to look back for outcome resolution
 
    //--- Display
    input string   __display__        = "══════ Display ══════";
@@ -299,6 +307,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
    int g_rejPullback= 0;
    int g_rejStack   = 0;
    int g_rejCost    = 0;             // v2.3: TP distance below spread multiple
+   int g_rejRange   = 0;             // v2.4: breakout blocked by the consolidation-range filter
 
    //--- v2.3: per-bar maintenance throttle (resolver + object cleanup)
    datetime g_lastMaintBar = 0;
@@ -445,7 +454,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
       g_flat   = 0;
       g_sltpCount = 0;
       g_rejRegime = 0; g_rejVolume = 0; g_rejDiv = 0; g_rejStrength = 0;
-      g_rejCooldown = 0; g_rejPullback = 0; g_rejStack = 0; g_rejCost = 0;
+      g_rejCooldown = 0; g_rejPullback = 0; g_rejStack = 0; g_rejCost = 0; g_rejRange = 0;
       g_lastMaintBar = 0;
 
       IndicatorShortName("RegimeSwitch Signals v2.4");
@@ -731,7 +740,9 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
       double score = 0;
 
       // 1. ADX strength (0-20 pts)
-      score += MathMin(20, (adx - InpADX_RangeThresh) / (50.0 - InpADX_RangeThresh) * 20.0);
+      //    v2.4: floored at 0. Below InpADX_RangeThresh it went negative, penalising the
+      //    squeeze breakouts that DetectRegimeBlended() routes to this module on purpose.
+      score += MathMax(0, MathMin(20, (adx - InpADX_RangeThresh) / (50.0 - InpADX_RangeThresh) * 20.0));
 
       // 2. EMA alignment (0-15 pts) — v2.1: ensure regime-transition entries don't get nuked
       //    when EMAs are momentarily tight. Floor at 0.5 ATR contribution so the score
@@ -932,7 +943,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
          g_pending = 0;
          g_flat = 0;
          g_rejRegime = 0; g_rejVolume = 0; g_rejDiv = 0; g_rejStrength = 0;
-         g_rejCooldown = 0; g_rejPullback = 0; g_rejStack = 0; g_rejCost = 0;
+         g_rejCooldown = 0; g_rejPullback = 0; g_rejStack = 0; g_rejCost = 0; g_rejRange = 0;
       }
       else
       {
@@ -1236,16 +1247,20 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
          {
             //--- Consolidation tightness filter
             double tightness = ConsolidationTightness(i, InpBO_LookbackBars, atr);
+            int boStart = i + 1;
+            double boHiHigh = iHigh(Symbol(), 0, iHighest(Symbol(), 0, MODE_HIGH, InpBO_LookbackBars, boStart));
+            double boLoLow  = iLow(Symbol(), 0, iLowest(Symbol(), 0, MODE_LOW, InpBO_LookbackBars, boStart));
             if(tightness > InpBO_MaxRangeATR || tightness < InpBO_MinRangeATR)
             {
-               // Skip: consolidation too wide (sloppy) or too narrow (noise)
+               // Skip: consolidation too wide (sloppy) or too narrow (noise).
+               // v2.4: count it when a breakout would otherwise have fired here, so
+               // the panel shows how many breakouts this filter blocks (like "pb").
+               if(BreakoutSignal(cls, iHigh(Symbol(), 0, i), iLow(Symbol(), 0, i), rsi, atr, emaF, emaS, diP, diM, bbUp, bbLo,
+                                 boHiHigh, boLoLow) != 0)
+                  g_rejRange++;
             }
             else
             {
-               int boStart = i + 1;
-               double boHiHigh = iHigh(Symbol(), 0, iHighest(Symbol(), 0, MODE_HIGH, InpBO_LookbackBars, boStart));
-               double boLoLow  = iLow(Symbol(), 0, iLowest(Symbol(), 0, MODE_LOW, InpBO_LookbackBars, boStart));
-
                int sig;
                if(InpBO_RequireEMA9Pullback)
                {
@@ -1622,6 +1637,10 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
 
       int lookback = MathMin(InpWL_MaxLookback, totalBars - 2);
 
+      //--- v2.4: chart prices are bid. Buys already pay the spread on entry; a sell
+      //    exits at the ask, so its SL/TP are hit when bid + spread reaches them.
+      double spreadPx = MarketInfo(Symbol(), MODE_SPREAD) * _Point;
+
       for(int i = lookback; i >= 1; i--)
       {
          bool hasSignal = false;
@@ -1681,8 +1700,8 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
             }
             else
             {
-               if(hi >= sl) slHit = true;
-               if(tp > 0 && lo <= tp) tpHit = true;
+               if(hi + spreadPx >= sl) slHit = true;
+               if(tp > 0 && lo + spreadPx <= tp) tpHit = true;
             }
 
             //--- v2.1: MR EMA9 invalidator — close on the wrong side of EMA9
@@ -2221,7 +2240,8 @@ void CheckAlerts()
          int total = g_wins + g_losses;
          double winRate = (total > 0) ? (double)g_wins / total * 100.0 : 0;
 
-         CreateLabel(g_prefix + "wlH", innerX, y, "WIN / LOSS", C'100,110,130', 8, false);
+         CreateLabel(g_prefix + "wlH", innerX, y, "WIN / LOSS  (last " +   // v2.4: show the window
+                     IntegerToString((int)MathMin(InpWL_MaxLookback, Bars - 2)) + ")", C'100,110,130', 8, false);
          y += lineH;
 
          color wrClr = C'160,170,190';
@@ -2250,7 +2270,8 @@ void CheckAlerts()
       y += lineH;
       string rj1 = "vol " + IntegerToString(g_rejVolume) +
                    "  div "  + IntegerToString(g_rejDiv) +
-                   "  str "  + IntegerToString(g_rejStrength);
+                   "  str "  + IntegerToString(g_rejStrength) +
+                   "  rng "  + IntegerToString(g_rejRange);   // v2.4
       string rj2 = "cool " + IntegerToString(g_rejCooldown) +
                    "  pb "   + IntegerToString(g_rejPullback) +
                    "  stk "  + IntegerToString(g_rejStack) +
