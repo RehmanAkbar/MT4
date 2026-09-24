@@ -24,6 +24,9 @@
    //|    alert on a cross that undid, then alerted again on close)     |
    //|  - MTF: full recalc once the higher timeframe's history loads or |
    //|    is backfilled (on first load the veto silently passed)        |
+   //|  - Panel REJECTED: new 'rng' counter for breakouts blocked by    |
+   //|    the consolidation-range filter (InpBO_Min/MaxRangeATR), which |
+   //|    rejected silently                                             |
    //|  v2.3 Improvements over v2.2:                                    |
    //|  - MTF causality fix: HTF ADX/ER now read the last CLOSED HTF    |
    //|    bar. Before, history used the HTF bar CONTAINING the local    |
@@ -299,6 +302,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
    int g_rejPullback= 0;
    int g_rejStack   = 0;
    int g_rejCost    = 0;             // v2.3: TP distance below spread multiple
+   int g_rejRange   = 0;             // v2.4: breakout blocked by the consolidation-range filter
 
    //--- v2.3: per-bar maintenance throttle (resolver + object cleanup)
    datetime g_lastMaintBar = 0;
@@ -445,7 +449,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
       g_flat   = 0;
       g_sltpCount = 0;
       g_rejRegime = 0; g_rejVolume = 0; g_rejDiv = 0; g_rejStrength = 0;
-      g_rejCooldown = 0; g_rejPullback = 0; g_rejStack = 0; g_rejCost = 0;
+      g_rejCooldown = 0; g_rejPullback = 0; g_rejStack = 0; g_rejCost = 0; g_rejRange = 0;
       g_lastMaintBar = 0;
 
       IndicatorShortName("RegimeSwitch Signals v2.4");
@@ -932,7 +936,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
          g_pending = 0;
          g_flat = 0;
          g_rejRegime = 0; g_rejVolume = 0; g_rejDiv = 0; g_rejStrength = 0;
-         g_rejCooldown = 0; g_rejPullback = 0; g_rejStack = 0; g_rejCost = 0;
+         g_rejCooldown = 0; g_rejPullback = 0; g_rejStack = 0; g_rejCost = 0; g_rejRange = 0;
       }
       else
       {
@@ -1236,16 +1240,20 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
          {
             //--- Consolidation tightness filter
             double tightness = ConsolidationTightness(i, InpBO_LookbackBars, atr);
+            int boStart = i + 1;
+            double boHiHigh = iHigh(Symbol(), 0, iHighest(Symbol(), 0, MODE_HIGH, InpBO_LookbackBars, boStart));
+            double boLoLow  = iLow(Symbol(), 0, iLowest(Symbol(), 0, MODE_LOW, InpBO_LookbackBars, boStart));
             if(tightness > InpBO_MaxRangeATR || tightness < InpBO_MinRangeATR)
             {
-               // Skip: consolidation too wide (sloppy) or too narrow (noise)
+               // Skip: consolidation too wide (sloppy) or too narrow (noise).
+               // v2.4: count it when a breakout would otherwise have fired here, so
+               // the panel shows how many breakouts this filter blocks (like "pb").
+               if(BreakoutSignal(cls, iHigh(Symbol(), 0, i), iLow(Symbol(), 0, i), rsi, atr, emaF, emaS, diP, diM, bbUp, bbLo,
+                                 boHiHigh, boLoLow) != 0)
+                  g_rejRange++;
             }
             else
             {
-               int boStart = i + 1;
-               double boHiHigh = iHigh(Symbol(), 0, iHighest(Symbol(), 0, MODE_HIGH, InpBO_LookbackBars, boStart));
-               double boLoLow  = iLow(Symbol(), 0, iLowest(Symbol(), 0, MODE_LOW, InpBO_LookbackBars, boStart));
-
                int sig;
                if(InpBO_RequireEMA9Pullback)
                {
@@ -2250,7 +2258,8 @@ void CheckAlerts()
       y += lineH;
       string rj1 = "vol " + IntegerToString(g_rejVolume) +
                    "  div "  + IntegerToString(g_rejDiv) +
-                   "  str "  + IntegerToString(g_rejStrength);
+                   "  str "  + IntegerToString(g_rejStrength) +
+                   "  rng "  + IntegerToString(g_rejRange);   // v2.4
       string rj2 = "cool " + IntegerToString(g_rejCooldown) +
                    "  pb "   + IntegerToString(g_rejPullback) +
                    "  stk "  + IntegerToString(g_rejStack) +
