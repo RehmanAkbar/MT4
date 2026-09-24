@@ -11,6 +11,15 @@
    //|    pullback bar it made the EMA9 retest impossible)              |
    //|  - MR EMA9 invalidator arms only after a close on the profitable |
    //|    side of EMA9; flat exits are counted apart from open trades   |
+   //|  - Regime state indexed by absolute bar. MT4 doesn't shift plain |
+   //|    arrays on a new bar, so v2.3 seeded every update from a stale |
+   //|    bar, and bars that closed live could end up with another      |
+   //|    regime (losing or gaining arrows) than after a reload. Each   |
+   //|    closed bar is now evaluated once, so rejection counters no    |
+   //|    longer grow on every tick                                     |
+   //|  - SL/TP lines, strength labels and X marks: drawn only within   |
+   //|    InpSLTP_MaxAge, cleaned whenever shown, wiped on full recalc  |
+   //|  - Buy entries include the spread for the newest signal too      |
    //|  v2.3 Improvements over v2.2:                                    |
    //|  - MTF causality fix: HTF ADX/ER now read the last CLOSED HTF    |
    //|    bar. Before, history used the HTF bar CONTAINING the local    |
@@ -346,6 +355,13 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
 
    //--- Higher timeframe
    int g_htfPeriod = 0;
+
+   //--- v2.4: the per-bar state arrays above (g_bwCache, g_rawRegime, ...) are
+   //    indexed by ABSOLUTE bar, 0 = oldest (see AbsIdx). MT4 shifts indicator
+   //    buffers when a new bar opens but not plain arrays, so the old
+   //    shift-indexed state went stale.
+   int      g_absTotal    = 0;       // rates_total of the current OnCalculate call
+   datetime g_absBaseTime = 0;       // open time of the oldest bar (absolute index 0)
 
    //+------------------------------------------------------------------+
    //| INIT                                                             |
@@ -744,6 +760,43 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
    }
 
    //+------------------------------------------------------------------+
+   //| v2.4: SHIFT -> ABSOLUTE BAR INDEX for the per-bar state arrays   |
+   //|   0 = oldest bar. A bar keeps its index as new bars arrive; the  |
+   //|   previous (older) bar of absolute index a is a - 1.             |
+   //+------------------------------------------------------------------+
+   int AbsIdx(int shift)
+   {
+      return g_absTotal - 1 - shift;
+   }
+
+   //--- v2.4: neutral regime state for a bar the regime logic skips, so the
+   //    next bar sees the same state live as after a reload
+   void ResetBarState(int a)
+   {
+      g_rawRegime[a]     = REGIME_NONE;
+      g_lastRegime[a]    = REGIME_NONE;
+      g_regimeStreak[a]  = 0;
+      g_deadZoneCount[a] = 0;
+   }
+
+   //--- v2.4: SL/TP lines, strength labels and X marks are drawn only inside
+   //    the window CleanupSLTP() keeps (InpSLTP_MaxAge <= 0 keeps everything)
+   bool WithinObjAge(int shift)
+   {
+      return (InpSLTP_MaxAge <= 0 || shift <= InpSLTP_MaxAge);
+   }
+
+   //--- v2.4: drop every per-bar object; a full recalc redraws what still applies
+   void DeletePerBarObjects()
+   {
+      ObjectsDeleteAll(0, g_prefix + "SL_");
+      ObjectsDeleteAll(0, g_prefix + "TP_");
+      ObjectsDeleteAll(0, g_prefix + "STR_");
+      ObjectsDeleteAll(0, g_prefix + "INV_");
+      ObjectsDeleteAll(0, g_prefix + "BG_");
+   }
+
+   //+------------------------------------------------------------------+
    //| CALCULATE                                                        |
    //+------------------------------------------------------------------+
    int OnCalculate(const int rates_total,
@@ -803,14 +856,22 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                   + 1;
       if(rates_total < warmup) return(0);
 
+      //--- v2.4: absolute indices stay valid only while bars are appended. If bars
+      //    were prepended or trimmed at the old end, recalc everything.
+      datetime oldestTime = iTime(Symbol(), 0, rates_total - 1);
+      if(prevCalc > 0 && (oldestTime != g_absBaseTime || ArraySize(g_bwCache) > rates_total))
+         prevCalc = 0;
+      g_absBaseTime = oldestTime;
+      g_absTotal    = rates_total;
+
+      //--- v2.4: incremental calls evaluate only newly closed bars (0 on an intrabar
+      //    tick). Re-evaluating bars 1..51 on every call existed to refresh the
+      //    shift-indexed state; it also re-counted rejections on every tick.
       int limit;
       if(prevCalc == 0)
          limit = rates_total - warmup + 1;
       else
-      {
-         limit = rates_total - prevCalc;
-         if(limit <= 0) limit = 1;
-      }
+         limit = MathMin(rates_total - prevCalc, rates_total - warmup + 1);
 
       //--- Cache management
       bool fullRecalc = (prevCalc == 0);
@@ -851,6 +912,8 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
             g_emaTrend[r]      = 0;
          }
 
+         DeletePerBarObjects();   // v2.4: nothing drawn before the recalc can linger
+
          g_wins = 0;
          g_losses = 0;
          g_pending = 0;
@@ -863,8 +926,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
          int oldSize = ArraySize(g_bwCache);
          if(oldSize < rates_total)
          {
-            int growth = rates_total - oldSize;
-
+            //--- v2.4: new slots sit at the END (absolute index), i.e. the new bars
             ArrayResize(g_bwCache, rates_total);
             ArrayResize(g_lastRegime, rates_total);
             ArrayResize(g_rawRegime, rates_total);
@@ -884,28 +946,27 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                g_signalOutcome[n] = 0;
                g_emaTrend[n]      = 0;
             }
-
-            limit = MathMax(limit, growth + InpBW_Lookback);
-            limit = MathMin(limit, rates_total - warmup + 1);
          }
       }
 
       g_prevRatesTotal = rates_total;
       g_panelCacheValid = false;
 
-      //--- Build bandwidth cache
-      int bwBuildFrom = MathMin(rates_total - 1, limit + InpBW_Lookback - 1);
-      for(int b = bwBuildFrom; b >= 0; b--)
+      //--- Build bandwidth cache (v2.4: absolute-indexed, so each closed bar is
+      //    computed once; the forming bar 0 is never read)
+      int bwBuildFrom = fullRecalc ? MathMin(rates_total - 1, limit + InpBW_Lookback - 1) : limit;
+      for(int b = bwBuildFrom; b >= 1; b--)
       {
-         double m = iBands(Symbol(), 0, InpBB_Period, InpBB_Dev, 0, PRICE_CLOSE, MODE_MAIN, b);
+         int    ab = AbsIdx(b);
+         double m  = iBands(Symbol(), 0, InpBB_Period, InpBB_Dev, 0, PRICE_CLOSE, MODE_MAIN, b);
          if(m > 0)
          {
             double u = iBands(Symbol(), 0, InpBB_Period, InpBB_Dev, 0, PRICE_CLOSE, MODE_UPPER, b);
             double l = iBands(Symbol(), 0, InpBB_Period, InpBB_Dev, 0, PRICE_CLOSE, MODE_LOWER, b);
-            g_bwCache[b] = (u - l) / m;
+            g_bwCache[ab] = (u - l) / m;
          }
          else
-            g_bwCache[b] = 0;
+            g_bwCache[ab] = 0;
       }
       g_bwCacheReady = true;
 
@@ -917,13 +978,19 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
 
       if(doMaint)
       {
-         if(InpShowSLTP && InpSLTP_MaxAge > 0) CleanupSLTP();
+         //--- v2.4: SL/TP lines, strength labels and X marks share one age limit;
+         //    clean whenever any of them is drawn (before: only with SL/TP lines
+         //    on, so labels and X marks were never removed with SL/TP off)
+         if((InpShowSLTP || InpShowStrength || InpInvalidateSignals) && InpSLTP_MaxAge > 0)
+            CleanupSLTP();
          if(InpShowRegimeBG) CleanupRegimeBG();
       }
 
       //--- Main loop
       for(int i = limit; i >= 1; i--)
       {
+         int a = AbsIdx(i);   // v2.4: index into the per-bar state arrays
+
          //=== STEP 1: Compute indicators ===
          double emaF    = iMA(Symbol(), 0, InpEMA_Fast,    0, InpMA_Method, PRICE_CLOSE, i);
          double emaS    = iMA(Symbol(), 0, InpEMA_Slow,    0, InpMA_Method, PRICE_CLOSE, i);
@@ -964,7 +1031,9 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
             g_mrBuy[i] = EMPTY_VALUE; g_mrSell[i] = EMPTY_VALUE;
             g_boBuy[i] = EMPTY_VALUE; g_boSell[i] = EMPTY_VALUE;
             g_strengthBuf[i] = 0.0; g_regimeBuf[i] = 0.0;
-            if(i < ArraySize(g_emaTrend)) g_emaTrend[i] = 0;
+            g_emaTrend[a] = 0;
+            g_signalStrength[a] = 0;
+            ResetBarState(a);
             continue;
          }
 
@@ -975,19 +1044,23 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
          g_ema9[i]    = ema9v;
 
          //--- v2.1: cache EMA9-vs-EMA20 sign for downstream gates and the resolver.
-         if(i < ArraySize(g_emaTrend))
-            g_emaTrend[i] = (ema9v > emaF) ? +1 : (ema9v < emaF ? -1 : 0);
+         g_emaTrend[a] = (ema9v > emaF) ? +1 : (ema9v < emaF ? -1 : 0);
 
          g_mrBuy[i]  = EMPTY_VALUE;
          g_mrSell[i] = EMPTY_VALUE;
          g_boBuy[i]  = EMPTY_VALUE;
          g_boSell[i] = EMPTY_VALUE;
-         g_signalStrength[i] = 0;
+         g_signalStrength[a] = 0;
          g_strengthBuf[i] = 0.0;
          g_regimeBuf[i]   = 0.0;
 
          if(InpUseSessionFilter && !IsBarInSession(i))
+         {
+            //--- v2.4: a session gap resets the regime state, live exactly as on reload
+            //    (before, the first in-session bar read leftovers from another bar live)
+            ResetBarState(a);
             continue;
+         }
 
          //=== STEP 2: Blended Regime Detection ===
          ENUM_REGIME rawRegime = DetectRegimeBlended(adx, bbUp, bbLo, bbMid, er, i);
@@ -995,19 +1068,19 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
          //--- Dead-zone persistence with decay
          if(rawRegime == REGIME_NONE)
          {
-            if(i + 1 < ArraySize(g_rawRegime) && g_rawRegime[i + 1] != REGIME_NONE)
+            if(a > 0 && g_rawRegime[a - 1] != REGIME_NONE)
             {
-               if(i + 1 < ArraySize(g_deadZoneCount) && g_deadZoneCount[i + 1] < InpDeadZoneDecay)
+               if(g_deadZoneCount[a - 1] < InpDeadZoneDecay)
                {
-                  rawRegime = g_rawRegime[i + 1];
-                  g_deadZoneCount[i] = g_deadZoneCount[i + 1] + 1;
+                  rawRegime = g_rawRegime[a - 1];
+                  g_deadZoneCount[a] = g_deadZoneCount[a - 1] + 1;
                }
                else
-                  g_deadZoneCount[i] = 0;  // decayed — force NONE
+                  g_deadZoneCount[a] = 0;  // decayed — force NONE
             }
          }
          else
-            g_deadZoneCount[i] = 0;  // reset when not in dead zone
+            g_deadZoneCount[a] = 0;  // reset when not in dead zone
 
          //--- v2.1: Apply MTF veto BEFORE hysteresis so a stale lastRegime can't
          //     be re-selected when local regime has reverted to NONE due to HTF
@@ -1023,13 +1096,13 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                rawRegime = REGIME_NONE;
          }
 
-         g_rawRegime[i] = rawRegime;
+         g_rawRegime[a] = rawRegime;
 
          //--- Hysteresis
-         if(i + 1 < ArraySize(g_rawRegime) && rawRegime == g_rawRegime[i + 1])
-            g_regimeStreak[i] = g_regimeStreak[i + 1] + 1;
+         if(a > 0 && rawRegime == g_rawRegime[a - 1])
+            g_regimeStreak[a] = g_regimeStreak[a - 1] + 1;
          else
-            g_regimeStreak[i] = 1;
+            g_regimeStreak[a] = 1;
 
          //--- v2.1: fast-path confirmation — strong ER or ADX bypasses streak wait.
          double erFastPath  = er;
@@ -1038,12 +1111,12 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                                (erFastPath >= 0.85 || adxFastPath >= 35.0));
 
          ENUM_REGIME regime = REGIME_NONE;
-         if(g_regimeStreak[i] >= InpRegimeConfirmBars || fastConfirm)
+         if(g_regimeStreak[a] >= InpRegimeConfirmBars || fastConfirm)
             regime = rawRegime;
-         else if(i + 1 < ArraySize(g_lastRegime) && rawRegime != REGIME_NONE && rawRegime == g_lastRegime[i + 1])
-            regime = g_lastRegime[i + 1];   // v2.2: hold prior regime only when raw still agrees (else stand aside as NONE)
+         else if(a > 0 && rawRegime != REGIME_NONE && rawRegime == g_lastRegime[a - 1])
+            regime = g_lastRegime[a - 1];   // v2.2: hold prior regime only when raw still agrees (else stand aside as NONE)
 
-         g_lastRegime[i] = regime;
+         g_lastRegime[a] = regime;
 
          //--- v2.3: export confirmed regime for iCustom callers
          g_regimeBuf[i] = (regime == REGIME_TREND) ? 1.0 : ((regime == REGIME_RANGE) ? -1.0 : 0.0);
@@ -1097,7 +1170,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                if(sig != 0)
                {
                   double strength = CalcMRStrength(setupCls, setupRsi, setupBBUp, setupBBLo, atr, volRatio, div, er);
-                  g_signalStrength[i] = strength;
+                  g_signalStrength[a] = strength;
 
                   if(strength < InpMinStrength)
                   {
@@ -1128,8 +1201,8 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                if(!HasRecentSignal(g_mrBuy, i, InpCooldownBars, rates_total))
                {
                   g_mrBuy[i] = iLow(Symbol(), 0, i) - offset;
-                  if(InpShowSLTP) DrawSLTP(i, sig, atr, 1, 0, 0, bbMid);
-                  if(InpShowStrength) DrawStrengthLabel(i, g_signalStrength[i], true);
+                  if(InpShowSLTP && WithinObjAge(i)) DrawSLTP(i, sig, atr, 1, 0, 0, bbMid);
+                  if(InpShowStrength && WithinObjAge(i)) DrawStrengthLabel(i, g_signalStrength[a], true);
                }
                else
                   g_rejCooldown++;
@@ -1139,8 +1212,8 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                if(!HasRecentSignal(g_mrSell, i, InpCooldownBars, rates_total))
                {
                   g_mrSell[i] = iHigh(Symbol(), 0, i) + offset;
-                  if(InpShowSLTP) DrawSLTP(i, sig, atr, 1, 0, 0, bbMid);
-                  if(InpShowStrength) DrawStrengthLabel(i, g_signalStrength[i], false);
+                  if(InpShowSLTP && WithinObjAge(i)) DrawSLTP(i, sig, atr, 1, 0, 0, bbMid);
+                  if(InpShowStrength && WithinObjAge(i)) DrawStrengthLabel(i, g_signalStrength[a], false);
                }
                else
                   g_rejCooldown++;
@@ -1200,7 +1273,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                {
                   double strength = CalcBOStrength(cls, rsi, atr, emaF, emaS, diP, diM, adx,
                                                    volRatio, er, tightness, boHiHigh, boLoLow);
-                  g_signalStrength[i] = strength;
+                  g_signalStrength[a] = strength;
                   if(strength < InpMinStrength)
                   {
                      sig = 0;
@@ -1220,8 +1293,8 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                   if(!HasRecentSignal(g_boBuy, i, InpCooldownBars, rates_total))
                   {
                      g_boBuy[i] = iLow(Symbol(), 0, i) - offset;
-                     if(InpShowSLTP) DrawSLTP(i, sig, atr, 2, boHiHigh, boLoLow, 0);
-                     if(InpShowStrength) DrawStrengthLabel(i, g_signalStrength[i], true);
+                     if(InpShowSLTP && WithinObjAge(i)) DrawSLTP(i, sig, atr, 2, boHiHigh, boLoLow, 0);
+                     if(InpShowStrength && WithinObjAge(i)) DrawStrengthLabel(i, g_signalStrength[a], true);
                   }
                   else
                      g_rejCooldown++;
@@ -1231,8 +1304,8 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                   if(!HasRecentSignal(g_boSell, i, InpCooldownBars, rates_total))
                   {
                      g_boSell[i] = iHigh(Symbol(), 0, i) + offset;
-                     if(InpShowSLTP) DrawSLTP(i, sig, atr, 2, boHiHigh, boLoLow, 0);
-                     if(InpShowStrength) DrawStrengthLabel(i, g_signalStrength[i], false);
+                     if(InpShowSLTP && WithinObjAge(i)) DrawSLTP(i, sig, atr, 2, boHiHigh, boLoLow, 0);
+                     if(InpShowStrength && WithinObjAge(i)) DrawStrengthLabel(i, g_signalStrength[a], false);
                   }
                   else
                      g_rejCooldown++;
@@ -1242,7 +1315,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
 
          //--- v2.3: export candidate strength (kept even when the signal was
          //    rejected downstream, so an EA can study near-misses too)
-         g_strengthBuf[i] = g_signalStrength[i];
+         g_strengthBuf[i] = g_signalStrength[a];
 
          //--- Regime background
          if(InpShowRegimeBG && i >= 1 && i <= InpRegimeBG_MaxBars)
@@ -1285,10 +1358,10 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
       int cnt = 0;
       if(g_bwCacheReady)
       {
-         int cacheSize = ArraySize(g_bwCache);
-         for(int j = shift; j < shift + InpBW_Lookback && j < cacheSize; j++)
+         for(int j = shift; j < shift + InpBW_Lookback && j < g_absTotal; j++)
          {
-            if(g_bwCache[j] > 0) { avgBW += g_bwCache[j]; cnt++; }
+            int aj = AbsIdx(j);   // v2.4: absolute-indexed cache
+            if(g_bwCache[aj] > 0) { avgBW += g_bwCache[aj]; cnt++; }
          }
       }
       if(cnt > 0) avgBW /= cnt;
@@ -1453,7 +1526,10 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
    {
       int execShift = MathMax(shift - 1, 0);
       double entry  = iOpen(Symbol(), 0, execShift);
-      if(direction > 0 && execShift > 0)
+      //--- v2.4: buys pay the spread for the newest signal too. Skipping it at
+      //    execShift 0 made a live signal's SL/TP (and cost/R:R gates) differ from
+      //    the same signal after a reload; it used to be redrawn a bar later.
+      if(direction > 0)
          entry += MarketInfo(Symbol(), MODE_SPREAD) * _Point;
 
       double sl = 0, tp = 0;
@@ -1546,13 +1622,13 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
 
          if(!hasSignal)
          {
-            g_signalOutcome[i] = 0;
+            g_signalOutcome[AbsIdx(i)] = 0;
             continue;
          }
 
          //--- Reconstruct entry, SL, TP via shared helper
          double atr = iATR(Symbol(), 0, InpATR_Period, i);
-         if(atr < _Point) { g_signalOutcome[i] = 0; continue; }
+         if(atr < _Point) { g_signalOutcome[AbsIdx(i)] = 0; continue; }
 
          //--- Reconstruct structural high/low for BO (matches main loop)
          double structHigh = 0, structLow = 0;
@@ -1632,7 +1708,7 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
             if(tpHit) { outcome = +1; break; }
          }
 
-         g_signalOutcome[i] = outcome;
+         g_signalOutcome[AbsIdx(i)] = outcome;
 
          if(outcome > 0) g_wins++;
          else if(outcome < 0) g_losses++;
@@ -1640,7 +1716,11 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
          else g_pending++;
 
          //--- Signal invalidation: gray out losing arrows
-         if(InpInvalidateSignals && outcome < 0)
+         //    v2.4: only inside the SL/TP age window (CleanupSLTP() deleted older X
+         //    marks and this re-created them every bar), and an X is removed if the
+         //    outcome is no longer a loss
+         string invName = g_prefix + "INV_" + IntegerToString((int)iTime(Symbol(), 0, i));
+         if(InpInvalidateSignals && outcome < 0 && WithinObjAge(i))
          {
             string objName = "";
             if(g_mrBuy[i]  != EMPTY_VALUE) objName = "MR Buy";
@@ -1649,7 +1729,6 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
             if(g_boSell[i] != EMPTY_VALUE) objName = "BO Sell";
 
             // Draw a gray "X" marker at the signal location to indicate invalidation
-            string invName = g_prefix + "INV_" + IntegerToString((int)iTime(Symbol(), 0, i));
             double invY = (direction > 0) ? iLow(Symbol(), 0, i) - InpArrowOffset_ATR * atr * 1.5
                                           : iHigh(Symbol(), 0, i) + InpArrowOffset_ATR * atr * 1.5;
             if(ObjectFind(0, invName) < 0)
@@ -1663,6 +1742,8 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
                ObjectSetInteger(0, invName, OBJPROP_BACK, false);
             }
          }
+         else if(ObjectFind(0, invName) >= 0)
+            ObjectDelete(0, invName);
       }
    }
 
@@ -1764,7 +1845,10 @@ input ENUM_MA_METHOD InpMA_Method       = MODE_EMA;   // MA method: SMA/EMA/SMMA
       CalcSignalSLTP(module, shift, signal, atr, structHigh, structLow, bbMid, entry, sl, tp);
 
       datetime t1 = iTime(Symbol(), 0, shift);
-      datetime t2 = iTime(Symbol(), 0, MathMax(shift - 3, 0));
+      //--- v2.4: lines span 3 bars. A new signal has no bars to its right yet, so
+      //    extend into the future instead of clamping to bar 0 (each bar is drawn
+      //    once now; the old per-bar redraw used to stretch the line later)
+      datetime t2 = (shift >= 3) ? iTime(Symbol(), 0, shift - 3) : (datetime)(t1 + 3 * PeriodSeconds());
       string timeKey = IntegerToString((int)t1);
 
       //--- SL line
@@ -1855,22 +1939,22 @@ void CheckAlerts()
       if(g_mrBuy[1] != EMPTY_VALUE)
       {
          ArrayResize(msgs, msgCount + 1);
-         msgs[msgCount++] = "MR BUY [" + IntegerToString((int)g_signalStrength[1]) + "]";
+         msgs[msgCount++] = "MR BUY [" + IntegerToString((int)g_signalStrength[AbsIdx(1)]) + "]";
       }
       if(g_mrSell[1] != EMPTY_VALUE)
       {
          ArrayResize(msgs, msgCount + 1);
-         msgs[msgCount++] = "MR SELL [" + IntegerToString((int)g_signalStrength[1]) + "]";
+         msgs[msgCount++] = "MR SELL [" + IntegerToString((int)g_signalStrength[AbsIdx(1)]) + "]";
       }
       if(g_boBuy[1] != EMPTY_VALUE)
       {
          ArrayResize(msgs, msgCount + 1);
-         msgs[msgCount++] = "BO BUY [" + IntegerToString((int)g_signalStrength[1]) + "]";
+         msgs[msgCount++] = "BO BUY [" + IntegerToString((int)g_signalStrength[AbsIdx(1)]) + "]";
       }
       if(g_boSell[1] != EMPTY_VALUE)
       {
          ArrayResize(msgs, msgCount + 1);
-         msgs[msgCount++] = "BO SELL [" + IntegerToString((int)g_signalStrength[1]) + "]";
+         msgs[msgCount++] = "BO SELL [" + IntegerToString((int)g_signalStrength[AbsIdx(1)]) + "]";
       }
    }
 
@@ -1983,7 +2067,8 @@ void CheckAlerts()
       }
 
       ENUM_REGIME regime = REGIME_NONE;
-      if(ArraySize(g_lastRegime) > 1) regime = g_lastRegime[1];
+      int a1 = AbsIdx(1);   // v2.4: absolute-indexed state
+      if(a1 >= 0 && a1 < ArraySize(g_lastRegime)) regime = g_lastRegime[a1];
 
       double bbRange = bbUp - bbLo;
       double bbPos   = (bbRange > 0) ? (cls - bbLo) / bbRange * 100.0 : 50.0;
@@ -1994,7 +2079,7 @@ void CheckAlerts()
       if(g_bwCacheReady && ArraySize(g_bwCache) > InpBW_Lookback + 1)
       {
          for(int j = 1; j <= InpBW_Lookback; j++)
-            if(g_bwCache[j] > 0) { avgBW += g_bwCache[j]; cnt++; }
+            if(g_bwCache[AbsIdx(j)] > 0) { avgBW += g_bwCache[AbsIdx(j)]; cnt++; }
       }
       if(cnt > 0) avgBW /= cnt;
       double sqzPct = (avgBW > 0) ? bw / avgBW * 100.0 : 100.0;
